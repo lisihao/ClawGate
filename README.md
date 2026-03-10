@@ -96,11 +96,11 @@
 │                                                   │                 │
 │                              ┌────────────────────┼──────────┐      │
 │                              ▼                    ▼          ▼      │
-│                      ┌──────────────┐    ┌────────────┐  ┌──────┐  │
-│                      │CloudDispatcher│    │ MLX Engine │  │llama │  │
-│                      │              │    │(Apple M1+) │  │.cpp  │  │
-│                      │ retry(3x)    │    └────────────┘  └──────┘  │
-│                      │ fallback     │         本地 (零成本)          │
+│                      ┌──────────────┐    ┌────────────┐  ┌────────────┐  │
+│                      │CloudDispatcher│    │ MLX Engine │  │ThunderLLAMA│  │
+│                      │              │    │(Apple M1+) │  │(llama.cpp) │  │
+│                      │ retry(3x)    │    └────────────┘  └────────────┘  │
+│                      │ fallback     │         本地引擎 (零成本)            │
 │                      │ circuit_break│                               │
 │                      │ in_flight    │                               │
 │                      └──────┬───────┘                               │
@@ -181,7 +181,7 @@ Background Lane (2 workers) ← priority=2 或 LONG 任务 (30s+)
 | 引擎 | 模型 | 信号量 | 成本 |
 | :--- | :--- | :--- | :--- |
 | MLX (Apple Silicon) | qwen2.5-7b-mlx, llama3.1-8b-mlx | 1 | 零 |
-| llama.cpp | qwen-1.7b, qwen2.5-7b-q4/q8 | 1 | 零 |
+| ThunderLLAMA (llama.cpp) | qwen-1.7b, qwen2.5-7b-q4/q8 | 1 | 零 |
 | DeepSeek API | deepseek-r1, deepseek-v3 | 5 | $0.0014/1K |
 | GLM API | glm-5, glm-4-flash | 5 | $0.0001-0.001/1K |
 | OpenAI API | gpt-4o | 3 | $0.005/1K |
@@ -366,7 +366,7 @@ clawgate/                           7,800+ 行
 │   └── continuous_batching.py     连续批处理调度器
 ├── storage/
 │   └── sqlite_store.py            全量请求日志 + 统计查询
-├── engines/                       本地推理引擎 (MLX/llama.cpp)
+├── engines/                       本地推理引擎 (MLX/ThunderLLAMA)
 ├── config/                        YAML 配置
 └── tests/                         196 个测试 (含 14 E2E)
 ```
