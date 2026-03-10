@@ -1,0 +1,85 @@
+# 引擎配置
+
+# 自动检测平台并选择引擎
+auto_select: true
+
+# 引擎优先级（按平台）
+platform_priority:
+  darwin_arm64:    # Apple Silicon (M1/M2/M3)
+    - mlx
+    - llamacpp
+  darwin_x86_64:   # Mac Intel
+    - llamacpp
+  linux:
+    - llamacpp
+    - vllm
+  windows:
+    - llamacpp
+
+# MLX-LM 配置（Apple Silicon 专用）
+mlx:
+  enabled: true
+  models:
+    - name: "qwen2.5-7b-mlx"
+      path: "models/qwen2.5-7b-instruct-mlx"
+      max_tokens: 2048
+      temperature: 0.7
+      use_cases: ["chat", "coding", "translation"]
+      cost_per_1k: 0.0001  # 本地成本（电费）
+      quality_score: 0.85
+
+    - name: "llama3.1-8b-mlx"
+      path: "models/llama-3.1-8b-instruct-mlx"
+      max_tokens: 4096
+      temperature: 0.7
+      use_cases: ["reasoning", "coding"]
+      cost_per_1k: 0.0001
+      quality_score: 0.88
+
+# llama.cpp 配置（跨平台）
+llamacpp:
+  enabled: true
+  n_ctx: 32768           # 上下文长度
+  n_gpu_layers: -1       # -1 = 全部加载到 GPU
+  n_threads: 8           # CPU 线程数
+
+  models:
+    # Qwen3-1.7B-Instruct (ThunderLLAMA 推荐)
+    - name: "qwen-1.7b"
+      path: "models/qwen3-1.7b-q4.gguf"
+      quantization: "q4_k_m"
+      max_tokens: 2048
+      use_cases: ["simple_qa", "fast_response", "testing"]
+      cost_per_1k: 0.00003
+      quality_score: 0.75
+
+    # Qwen2.5-7B-Instruct (标准版本)
+    - name: "qwen2.5-7b-q8"
+      path: "models/qwen2.5-7b-instruct-q8_0.gguf"
+      quantization: "q8_0"
+      max_tokens: 2048
+      use_cases: ["chat", "coding", "translation"]
+      cost_per_1k: 0.0001
+      quality_score: 0.85
+
+    - name: "qwen2.5-7b-q4"
+      path: "models/qwen2.5-7b-instruct-q4_k_m.gguf"
+      quantization: "q4_k_m"
+      max_tokens: 2048
+      use_cases: ["simple_tasks", "fast_response"]
+      cost_per_1k: 0.00005
+      quality_score: 0.78
+
+# vLLM 配置（预留接口，暂未实现）
+vllm:
+  enabled: false
+  endpoint: "http://localhost:8000"
+  api_key: null
+  models: []
+
+# SGLang 配置（预留接口，暂未实现）
+sglang:
+  enabled: false
+  endpoint: "http://localhost:30000"
+  api_key: null
+  models: []

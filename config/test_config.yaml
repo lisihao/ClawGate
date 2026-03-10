@@ -1,0 +1,42 @@
+# 测试配置 - ThunderLLAMA + 云端模型
+
+# 本地引擎配置（使用 llama.cpp 作为 ThunderLLAMA 的后端）
+llamacpp:
+  enabled: true
+  n_ctx: 32768
+  n_gpu_layers: -1  # -1 = 全部 GPU
+  n_threads: 8
+  models:
+    # Qwen2.5-1.5B-Instruct (轻量级测试模型)
+    - name: "qwen-1.7b"
+      path: "models/qwen2.5-1.5b-instruct-q8_0.gguf"
+      max_tokens: 2048
+      temperature: 0.7
+
+# 云端模型（用于对比验证）
+cloud_models:
+  - name: "glm-4-flash"
+    provider: "glm"
+    api_key_env: "GLM_API_KEY"
+    cost_per_1k: 0.0001
+    quality_score: 0.8
+
+  - name: "gpt-4o-mini"
+    provider: "openai"
+    api_key_env: "OPENAI_API_KEY"
+    cost_per_1k: 0.00015
+    quality_score: 0.85
+
+# 测试场景
+test_scenarios:
+  - name: "simple_qa"
+    prompt: "什么是机器学习？用一句话回答。"
+    models: ["qwen-1.7b", "glm-4-flash", "gpt-4o-mini"]
+
+  - name: "code_generation"
+    prompt: "写一个 Python 函数计算斐波那契数列"
+    models: ["qwen-1.7b", "glm-4-flash", "gpt-4o-mini"]
+
+  - name: "reasoning"
+    prompt: "分析：为什么本地推理比云端 API 延迟更低？"
+    models: ["qwen-1.7b", "glm-4-flash", "gpt-4o-mini"]
