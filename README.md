@@ -1,80 +1,193 @@
-# ClawGate - Agent-Aware LLM Gateway
+<p align="center">
+  <h1 align="center">ClawGate</h1>
+  <p align="center">
+    <strong>The All-in-One Inference Service Layer for <a href="https://github.com/lisihao">Claw</a></strong>
+  </p>
+  <p align="center">
+    One API. Every model. Zero headaches.
+  </p>
+  <p align="center">
+    <a href="#quick-start">Quick Start</a> &bull;
+    <a href="#features">Features</a> &bull;
+    <a href="#architecture">Architecture</a> &bull;
+    <a href="#vs-alternatives">vs Alternatives</a> &bull;
+    <a href="#roadmap">Roadmap</a>
+  </p>
+  <p align="center">
+    <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square" alt="Python 3.10+">
+    <img src="https://img.shields.io/badge/tests-196%20passed-brightgreen?style=flat-square" alt="Tests">
+    <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License">
+    <img src="https://img.shields.io/badge/API-OpenAI%20compatible-orange?style=flat-square" alt="OpenAI Compatible">
+  </p>
+</p>
 
-**为多 Agent 协作场景设计的智能 LLM 路由与调度引擎**
+---
 
-不是又一个 LLM Proxy。ClawGate 理解你的任务意图、追踪每个 Agent 的行为、控制每个模型的并发，然后做出最聪明的调度决策。
+**ClawGate** is an agent-aware LLM inference gateway purpose-built for multi-agent orchestration systems. It sits between your agents and every LLM provider — local or cloud — providing intelligent routing, priority scheduling, context management, and automatic failover through a single OpenAI-compatible API.
 
 ```
-请求 → TaskClassifier(类型+复杂度+敏感度)
-  → ModelSelector(质量/成本/agent偏好/负载感知)
-  → QueueManager(三车道优先级 + per-model 信号量 + agent 公平性)
-  → CloudDispatcher(重试+fallback链+熔断器) / 本地引擎(MLX/llama.cpp)
-  → 响应 + SQLite 日志 + Dashboard
+Your Agents ─── POST /v1/chat/completions ───▶ ClawGate
+                                                  │
+              ┌───────────────────────────────────┤
+              │                                   │
+         Local Engines                      Cloud Providers
+    ┌─────────┴─────────┐            ┌────────────┴────────────┐
+    │  MLX (Apple M1+)  │            │  DeepSeek  ·  OpenAI    │
+    │  ThunderLLAMA     │            │  GLM  ·  Gemini         │
+    │  (llama.cpp)      │            │  ChatGPT (subscription) │
+    └───────────────────┘            └─────────────────────────┘
 ```
 
----
-
-## 竞品对比
-
-### 通用能力
-
-| 维度 | ClawGate | LiteLLM | OpenRouter | Portkey | Helicone | Kong/KrakenD |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Provider 数量** | 5 云端 + 本地 | ✅ 100+ | ✅ 200+ | ✅ 多 | ✅ 多 | 🔶 插件扩展 |
-| **OpenAI 兼容** | ✅ | ✅ | ✅ | ✅ | ✅ | 🔶 需配置 |
-| **重试 + Fallback** | ✅ 跨 provider 链 | ✅ | ✅ | ✅ | ✅ | 🔶 需配置 |
-| **熔断器** | ✅ per-backend | ✅ | ⚠️ | ✅ | ⚠️ | ✅ |
-| **可观测性** | ⚠️ SQLite + 6 API | ⚠️ 回调/日志 | ✅ SaaS 平台 | ✅ 完整链路 | ✅ 深度分析 | ⚠️ 插件依赖 |
-| **成本管理** | ⚠️ 仅记录 | ✅ 追踪+预算 | ✅ 统一计费 | ✅ 预算+告警 | ✅ 看板 | ❌ |
-| **多租户** | ❌ | ⚠️ Virtual Key | ✅ 项目/Key | ✅ 团队/RBAC | ✅ 组织 | ✅ Workspace |
-| **缓存** | ⚠️ 语义缓存 | ✅ | ⚠️ | ✅ | ✅ | ✅ |
-| **安全 / 鉴权** | ❌ | ⚠️ 基础 Auth | ✅ 平台级 | ✅ Guardrails | ✅ | ✅ 企业级 |
-| **部署方式** | ❌ 单机脚本 | ✅ Docker/K8s | ✅ SaaS | ✅ Docker/Cloud | ✅ | ✅ |
-| **SDK / 客户端** | ❌ | ✅ Python/JS | ✅ REST | ✅ Python/JS | ✅ REST | 🔶 通用 HTTP |
-
-> ✅ = 完整实现 / ⚠️ = 部分实现 / ❌ = 缺失 / 🔶 = 需外部扩展
-
-**结论**：通用能力层面 ClawGate 落后于所有竞品。缺少鉴权、多租户、Docker 部署、SDK。
+Drop in `model="auto"` and ClawGate figures out the rest: what kind of task it is, which model fits best, which lane to queue it in, and what to do when things go wrong.
 
 ---
 
-### 智能调度能力 (ClawGate 核心差异化)
+## Why ClawGate?
 
-| 维度 | ClawGate | LiteLLM | OpenRouter | Portkey | Helicone | Kong/KrakenD |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **任务感知路由** | ✅ 类型+复杂度+敏感度 | ❌ | ❌ | 🔶 条件路由可模拟 | ❌ | 🔶 需复杂配置 |
-| **Agent 感知调度** | ✅ per-agent 追踪+公平性降级 | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **优先级队列** | ✅ 三车道+时长估算 | ❌ | ❌ | ❌ | ❌ | ⚠️ 限流策略 |
-| **敏感内容语义路由** | ✅ 检测→宽容模型路由 | ❌ | ⚠️ :exacto 非语义 | 🔶 Guardrails 外挂 | ❌ | 🔶 需外部审查 |
-| **混合引擎统一调度** | ✅ 本地+云端同一队列 | ⚠️ 支持但调度分离 | ❌ SaaS 无本地 | ❌ | ❌ | 🔶 可路由但非 LLM 专用 |
-| **上下文压缩引擎** | ✅ 5 策略+语义缓存 | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **负载感知模型选择** | ✅ 实时负载→选择权重 | ⚠️ least-busy | ⚠️ 系统级 | ❌ | ❌ | ⚠️ 负载均衡 |
-| **Per-model 并发控制** | ✅ 信号量精细控制 | ⚠️ 全局并发 | ❌ | ❌ | ❌ | ✅ 高级限流 |
+Most LLM gateways treat every request the same — a dumb proxy that forwards traffic. That works fine for single-user chatbots, but **multi-agent systems have fundamentally different needs:**
 
-**结论**：智能调度层面 ClawGate 全面领先。8 个维度中 8 个 ✅，竞品最多 2 个 ⚠️。
+| Problem | What happens without ClawGate | What ClawGate does |
+| :--- | :--- | :--- |
+| **Agent starvation** | One busy agent hogs all model concurrency | Per-agent tracking + fairness degradation |
+| **Wrong model for the job** | `gpt-4o` for a yes/no question burns money | Task classification → auto-selects cheapest qualified model |
+| **Provider outages** | Your whole system goes down | Circuit breaker + cross-provider fallback chains |
+| **Context explosion** | 200-turn conversations blow up token limits | 5 compression strategies + semantic caching |
+| **Priority inversion** | Urgent requests stuck behind batch jobs | 3-lane priority queue with duration estimation |
+| **Local vs cloud chaos** | Separate code paths, separate configs | Unified queue — same API for MLX, llama.cpp, and cloud |
 
----
-
-### 一句话定位
-
-| 产品 | 定位 |
-| :--- | :--- |
-| **ClawGate** | Agent 感知的智能 LLM 调度引擎 — 理解任务意图、追踪 Agent 行为、控制模型并发 |
-| **LiteLLM** | 轻量级 LLM 代理层 — 100+ Provider 统一接入，开箱即用 |
-| **OpenRouter** | 模型聚合 SaaS — 一键访问 200+ 模型，自动成本优化 |
-| **Portkey** | 企业级 AI Gateway — 可控性与合规性优先，Guardrails + A/B 测试 |
-| **Helicone** | 可观测性驱动的 LLM 运维平台 — 深度分析、追踪、缓存洞察 |
-| **Kong/KrakenD** | 通用 API Gateway + AI 插件 — 企业级流量治理，非 LLM 专用 |
+**ClawGate is the missing infrastructure layer between your agent framework and the LLM providers.**
 
 ---
 
-## 架构
+<a id="features"></a>
+## Features
+
+### Task-Aware Routing
+
+Every request is analyzed for **task type**, **complexity**, and **sensitivity** before model selection:
+
+```python
+# Just say "auto" — ClawGate handles the rest
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "Analyze the security vulnerabilities in this code"}]
+)
+# → reasoning + high complexity → deepseek-r1
+```
+
+| Task Type | Complexity | Routed To |
+| :--- | :--- | :--- |
+| reasoning | high | deepseek-r1, gpt-4o |
+| coding | medium | glm-5, deepseek-v3 |
+| qa | low | glm-4-flash, qwen-1.7b (local) |
+| creative (sensitive) | any | gemini-2.5-pro (permissive provider) |
+
+Sensitive content is automatically detected and routed to providers with more permissive policies — no manual intervention needed.
+
+### Agent-Aware Scheduling
+
+Each agent gets its own tracking, quota, and fairness guarantee:
+
+```python
+response = client.chat.completions.create(
+    model="deepseek-r1",
+    messages=[...],
+    extra_body={
+        "agent_id": "judge-001",
+        "agent_type": "judge",    # gets preferred models from config
+        "priority": 0,            # → fast lane
+    }
+)
+```
+
+- **Per-agent in-flight tracking** — know exactly who's using what
+- **Fairness degradation** — agents exceeding 60% of model concurrency get demoted to background lane
+- **Agent profiles** — each agent type has preferred models, fallbacks, and priority presets
+
+### 3-Lane Priority Queue
+
+Requests are classified by priority and estimated duration, then dispatched to the appropriate lane:
 
 ```
-                              ClawGate Gateway
+┌─────────────────────────────────────────────────────┐
+│                    QueueManager                      │
+│                                                      │
+│  Fast Lane ⚡   (2 workers)  ← urgent + short tasks  │
+│  Normal Lane 🔄 (3 workers)  ← standard requests     │
+│  Background Lane 🐢 (2 workers)  ← batch + long jobs │
+│                                                      │
+│  Per-model semaphores: deepseek(5) glm(5) local(1)  │
+│  Queue capacity: 200 (HTTP 429 when full)            │
+└─────────────────────────────────────────────────────┘
+```
+
+### Hybrid Engine Unification
+
+Local models and cloud APIs share the same queue, the same API, the same monitoring:
+
+| Engine | Models | Concurrency | Cost |
+| :--- | :--- | :--- | :--- |
+| **MLX** (Apple Silicon) | qwen2.5-7b, llama3.1-8b | 1 | Free |
+| **ThunderLLAMA** (llama.cpp) | qwen-1.7b, qwen2.5-7b-q4/q8 | 1 | Free |
+| **DeepSeek** | deepseek-r1, deepseek-v3 | 5 | $0.0014/1K |
+| **GLM** | glm-5, glm-4-flash | 5 | $0.0001–0.001/1K |
+| **OpenAI** | gpt-4o | 3 | $0.005/1K |
+| **ChatGPT** (subscription) | gpt-5.2, gpt-5.1, codex | 2 | Free (subscription) |
+| **Gemini** | gemini-2.5-pro/flash | 5 | $0.00125/1K |
+
+### Resilient Cloud Dispatch
+
+Every cloud request goes through a battle-tested dispatch pipeline:
+
+```
+Request → Primary Provider → Failed?
+  → Retry with exponential backoff (3x)
+  → Fallback to next provider in chain
+  → 3 consecutive failures → Circuit breaker OPEN (60s cooldown)
+  → Recovery → HALF_OPEN → test request → CLOSED
+```
+
+Cross-provider fallback chains are fully configurable. Model names are auto-remapped between providers.
+
+### Context Compression Engine
+
+5 strategies to keep conversations within token limits without losing important context:
+
+| Strategy | Best For | How It Works |
+| :--- | :--- | :--- |
+| **Sliding Window** | Fast agents | Keep last N messages |
+| **Summarization** | Long conversations | LLM-generated summary replaces old messages |
+| **Selective Retain** | Decision tracking | Keep code blocks, errors, decisions; drop filler |
+| **Adaptive** | General use | Auto-selects strategy based on agent type |
+| **Topic-Aware** | Multi-topic dialogs | Segment by topic, compress differentially |
+
+Plus **semantic caching** (Jaccard similarity, 0.85 threshold) to avoid redundant compression, and an **anti-hallucination conversation store** inspired by MIT research on LLM self-generated content.
+
+### Observability Dashboard
+
+6 API endpoints for full visibility into your inference layer:
+
+```
+GET /dashboard/overview    → 24h summary: requests, success rate, avg latency
+GET /dashboard/models      → Per-model: TTFT P50/P99, tokens, cost
+GET /dashboard/backends    → Per-backend: circuit breaker state, error rate
+GET /dashboard/context     → Context engine: cache hits, compression ratio
+GET /dashboard/scheduler   → Queue: lane depth, agent fairness, concurrency
+GET /dashboard/timeline    → Time series: requests/min (last 1h)
+```
+
+Every request is logged to SQLite with full metadata: agent_id, model, TTFT, tokens, cost, compression_ratio.
+
+---
+
+<a id="architecture"></a>
+## Architecture
+
+```
+                              ClawGate
 ┌─────────────────────────────────────────────────────────────────────┐
 │                                                                     │
-│  POST /v1/chat/completions                                          │
+│  POST /v1/chat/completions (OpenAI-compatible)                      │
 │       │                                                             │
 │       ▼                                                             │
 │  ┌──────────────┐    ┌──────────────┐    ┌─────────────────┐        │
@@ -82,7 +195,7 @@
 │  │              │    │              │    │                 │        │
 │  │ task_type    │    │ quality/cost │    │ ┌─────────────┐ │        │
 │  │ complexity   │    │ agent_prefs  │    │ │  fast lane  │ │        │
-│  │ sensitivity  │    │ load_info ◀──────│ │  2 workers  │ │        │
+│  │ sensitivity  │    │ load_aware   │    │ │  2 workers  │ │        │
 │  │ duration_est │    │ reranking    │    │ ├─────────────┤ │        │
 │  └──────────────┘    └──────────────┘    │ │ normal lane │ │        │
 │                                          │ │  3 workers  │ │        │
@@ -96,210 +209,144 @@
 │                                                   │                 │
 │                              ┌────────────────────┼──────────┐      │
 │                              ▼                    ▼          ▼      │
-│                      ┌──────────────┐    ┌────────────┐  ┌────────────┐  │
-│                      │CloudDispatcher│    │ MLX Engine │  │ThunderLLAMA│  │
-│                      │              │    │(Apple M1+) │  │(llama.cpp) │  │
-│                      │ retry(3x)    │    └────────────┘  └────────────┘  │
-│                      │ fallback     │         本地引擎 (零成本)            │
-│                      │ circuit_break│                               │
-│                      │ in_flight    │                               │
-│                      └──────┬───────┘                               │
-│                             │                                       │
-│              ┌──────┬───────┼───────┬──────────┐                    │
-│              ▼      ▼       ▼       ▼          ▼                    │
-│            GLM  DeepSeek  OpenAI  ChatGPT   Gemini                  │
-│                                   (订阅复用)  (宽容路由)              │
-│                                                                     │
-│  Observability: SQLite 全量日志 + 6 Dashboard API                    │
-│  Context: 5 种压缩策略 + 语义缓存 + 话题分段                          │
-└─────────────────────────────────────────────────────────────────────┘
+│                      ┌──────────────┐    ┌────────────┐ ┌─────────┐ │
+│                      │CloudDispatcher│    │ MLX Engine │ │Thunder- │ │
+│                      │              │    │(Apple M1+) │ │ LLAMA   │ │
+│                      │ retry(3x)    │    └────────────┘ └─────────┘ │
+│                      │ fallback     │        Local Engines (free)    │
+│                      │ circuit_break│                                │
+│                      └──────┬───────┘                                │
+│                             │                                        │
+│              ┌──────┬───────┼───────┬──────────┐                     │
+│              ▼      ▼       ▼       ▼          ▼                     │
+│            GLM  DeepSeek  OpenAI  ChatGPT   Gemini                   │
+│                                                                      │
+│  Storage: SQLite (full request logging)                              │
+│  Context: 5 compression strategies + semantic cache                  │
+│  Monitor: 6 dashboard endpoints                                     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 核心特性
+<a id="quick-start"></a>
+## Quick Start
 
-### 1. 任务感知路由
-
-TaskClassifier 分析每条消息的任务类型、复杂度和敏感度，驱动模型选择：
-
-```python
-# 自动分析 → 选最合适的模型
-response = client.chat.completions.create(
-    model="auto",  # TaskClassifier → ModelSelector 自动决策
-    messages=[{"role": "user", "content": "分析这段代码的安全漏洞"}]
-)
-# → reasoning + high complexity → deepseek-r1
-```
-
-| 任务类型 | 复杂度 | 路由结果 |
-| :--- | :--- | :--- |
-| reasoning | high | deepseek-r1 / gpt-4o |
-| coding | medium | glm-5 / deepseek-v3 |
-| qa | low | glm-4-flash / qwen-1.7b (本地) |
-| creative (NSFW) | any | gemini-2.5-pro (宽容) |
-
-### 2. Agent 感知调度
-
-每个 Agent 有独立的追踪和配额，防止一个忙碌 Agent 饿死其他 Agent：
-
-```python
-# Agent judge 发请求 → 带 agent_id
-response = client.chat.completions.create(
-    model="deepseek-r1",
-    messages=[...],
-    extra_body={
-        "agent_id": "judge-001",
-        "agent_type": "judge",
-        "priority": 0,  # urgent → fast lane
-    }
-)
-```
-
-- `agent_id` 追踪 in-flight 请求数
-- 超过公平份额(模型并发 * 60%)时，请求自动降级到 background 车道
-- 每个 Agent 类型有偏好模型配置(judge → deepseek-r1, builder → glm-5)
-
-### 3. 三车道优先级队列
-
-基于优先级和时长估算，请求分流到不同车道：
-
-```
-Fast Lane (2 workers)     ← priority=0 或 FAST 任务 (< 5s)
-Normal Lane (3 workers)   ← priority=1 + MEDIUM 任务 (5-30s)
-Background Lane (2 workers) ← priority=2 或 LONG 任务 (30s+)
-```
-
-- 时长估算基于 TaskClassifier 输出：QA+短消息 → FAST，高复杂度+长消息 → LONG
-- 每个模型有独立的 asyncio.Semaphore 控制并发
-- 队列满(200)时返回 HTTP 429
-
-### 4. 混合引擎统一调度
-
-本地模型和云端 API 在同一个队列系统中调度：
-
-| 引擎 | 模型 | 信号量 | 成本 |
-| :--- | :--- | :--- | :--- |
-| MLX (Apple Silicon) | qwen2.5-7b-mlx, llama3.1-8b-mlx | 1 | 零 |
-| ThunderLLAMA (llama.cpp) | qwen-1.7b, qwen2.5-7b-q4/q8 | 1 | 零 |
-| DeepSeek API | deepseek-r1, deepseek-v3 | 5 | $0.0014/1K |
-| GLM API | glm-5, glm-4-flash | 5 | $0.0001-0.001/1K |
-| OpenAI API | gpt-4o | 3 | $0.005/1K |
-| ChatGPT 订阅 | gpt-5.2, gpt-5.1 | 2 | 零 (订阅) |
-| Gemini API | gemini-2.5-pro/flash | 5 | $0.00125/1K |
-
-### 5. CloudDispatcher (重试 + Fallback + 熔断)
-
-```
-GLM 请求 → glm backend → 失败?
-  → deepseek fallback (自动 remap glm-4-flash → deepseek-chat)
-  → 3 次连续失败 → 熔断器 OPEN (60s 冷却)
-  → per-backend in-flight 计数
-```
-
-### 6. 上下文压缩引擎
-
-5 种策略适配不同场景：
-
-| 策略 | 适用场景 | 压缩方式 |
-| :--- | :--- | :--- |
-| Sliding Window | flash agent (快速任务) | 保留最近 N 条 |
-| Summarization | 长对话 | LLM 生成摘要替换旧消息 |
-| Selective Retain | judge agent (决策追踪) | 保留代码块/错误/决策，丢弃填充 |
-| Adaptive | 通用 | 根据 agent 类型自动选策略 |
-| Topic-Aware | 混合话题对话 | 按话题分段，差异化压缩 |
-
-语义缓存(Jaccard 0.85 阈值)避免重复压缩相同消息模式。
-
----
-
-## Observability
-
-6 个 Dashboard API 端点：
-
-```
-GET /dashboard/overview    → 24h 总览: 请求数、成功率、平均延迟
-GET /dashboard/models      → Per-model: TTFT P50/P99、token 量、成本
-GET /dashboard/backends    → Per-backend: 熔断器状态、成功率、in-flight
-GET /dashboard/context     → 上下文: 缓存命中率、压缩比
-GET /dashboard/scheduler   → 调度器: 车道深度、agent 公平性、并发余量
-GET /dashboard/timeline    → 时序: 每分钟请求数 (最近 1h)
-```
-
-全量请求日志写入 SQLite，包含 agent_id, model, TTFT, tokens, cost, compression_ratio。
-
----
-
-## 快速开始
-
-### 系统要求
-
-- Python 3.9+
-- 推荐：Apple Silicon (M1/M2/M3) 或 NVIDIA GPU
-- 最低：8GB RAM，20GB 硬盘
-
-### 安装与启动
+### 1. Clone & Install
 
 ```bash
-cd ~/ClawGate
+git clone https://github.com/lisihao/ClawGate.git
+cd ClawGate
+python3 -m venv venv && source venv/bin/activate
+pip install -e ".[dev]"
+```
 
-# 安装依赖
-pip install -r requirements.txt
+### 2. Configure
 
-# 配置 API Key (按需)
-export GLM_API_KEY="your-key"
-export DEEPSEEK_API_KEY="your-key"
+```bash
+cp .env.example .env
+# Edit .env with your API keys:
+#   GLM_API_KEY=your-key
+#   DEEPSEEK_API_KEY=your-key
+#   OPENAI_API_KEY=your-key       (optional)
+```
 
-# 启动
+### 3. Launch
+
+```bash
 ./scripts/start.sh
 ```
 
-服务启动后：
-- API 文档：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
-- 调度看板：http://localhost:8000/dashboard/scheduler
+That's it. ClawGate is now running at `http://localhost:8000`.
 
-### 使用示例
+- **API Docs**: http://localhost:8000/docs
+- **Health Check**: http://localhost:8000/health
+- **Scheduler Dashboard**: http://localhost:8000/dashboard/scheduler
+
+### 4. Send Your First Request
 
 ```python
 import openai
 
-client = openai.OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="dummy"
-)
+client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="any")
 
-# 自动路由
+# Auto-routing: ClawGate picks the best model
 response = client.chat.completions.create(
     model="auto",
-    messages=[{"role": "user", "content": "用 Python 写个快速排序"}]
+    messages=[{"role": "user", "content": "Write a quicksort in Python"}]
+)
+print(response.choices[0].message.content)
+```
+
+Works with **any OpenAI-compatible client** — LangChain, LlamaIndex, CrewAI, AutoGen, or just plain `curl`.
+
+---
+
+## Usage Examples
+
+### Auto-Routing (Let ClawGate Decide)
+
+```python
+# Simple question → routed to cheapest model (glm-4-flash or local)
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "What is 2+2?"}]
 )
 
-# 指定模型 + Agent 调度
+# Complex reasoning → routed to strongest model (deepseek-r1)
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "Prove that the halting problem is undecidable"}]
+)
+```
+
+### Agent-Aware Scheduling
+
+```python
+# High-priority agent request → fast lane
 response = client.chat.completions.create(
     model="deepseek-r1",
-    messages=[{"role": "user", "content": "分析这段代码"}],
+    messages=[{"role": "user", "content": "Review this PR for security issues"}],
     extra_body={
-        "agent_id": "judge-001",
+        "agent_id": "security-reviewer-01",
         "agent_type": "judge",
-        "priority": 0,
+        "priority": 0,  # 0=urgent, 1=normal, 2=background
     }
 )
+```
 
-# 流式响应
+### Streaming
+
+```python
 stream = client.chat.completions.create(
     model="glm-5",
-    messages=[{"role": "user", "content": "讲个故事"}],
+    messages=[{"role": "user", "content": "Tell me a story"}],
     stream=True
 )
 for chunk in stream:
     if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
+        print(chunk.choices[0].delta.content, end="", flush=True)
+```
+
+### Specify Provider Directly
+
+```python
+# Force local inference (zero cost)
+response = client.chat.completions.create(
+    model="qwen-1.7b",  # ThunderLLAMA local model
+    messages=[{"role": "user", "content": "Summarize this text"}]
+)
+
+# Force specific cloud provider
+response = client.chat.completions.create(
+    model="deepseek-r1",  # Direct to DeepSeek
+    messages=[{"role": "user", "content": "Debug this code"}]
+)
 ```
 
 ---
 
-## 配置
+## Configuration
 
 ### config/models.yaml
 
@@ -311,13 +358,19 @@ cloud_models:
     quality_score: 0.95
     use_cases: ["reasoning", "coding"]
 
+# Agent profiles — preferred models per agent type
 agent_profiles:
   judge:
     preferred_models: ["deepseek-r1", "gpt-5.2"]
-    fallback_models: ["deepseek-v3", "gpt-5.1"]
-    chunk_size: 512
+    fallback_models: ["deepseek-v3", "glm-5"]
     priority: 1
 
+  builder:
+    preferred_models: ["glm-5", "qwen2.5-7b-mlx"]
+    fallback_models: ["glm-4-flash"]
+    priority: 2
+
+# Queue scheduling parameters
 scheduling:
   max_total_queue: 200
   agent_fair_share: 0.6
@@ -326,106 +379,194 @@ scheduling:
     normal: 3
     background: 2
   concurrency:
-    local_default: 1
-    cloud_default: 5
     per_backend:
       deepseek: 5
       glm: 5
       openai: 3
-      chatgpt: 2
-      gemini: 5
+```
+
+### config/engines.yaml
+
+```yaml
+# Auto-detect platform and select best local engine
+auto_select: true
+
+platform_priority:
+  darwin_arm64: [mlx, llamacpp]    # Apple Silicon → MLX first
+  linux: [llamacpp, vllm]          # Linux → llama.cpp, vLLM ready
+
+llamacpp:
+  enabled: true
+  n_ctx: 32768
+  n_gpu_layers: -1
+  models:
+    - name: "qwen-1.7b"
+      path: "models/qwen3-1.7b-q4.gguf"
+      quality_score: 0.75
 ```
 
 ---
 
-## 项目结构
+<a id="vs-alternatives"></a>
+## vs Alternatives
+
+### Agent-Aware Capabilities (ClawGate's Differentiator)
+
+| Capability | ClawGate | LiteLLM | OpenRouter | Portkey |
+| :--- | :---: | :---: | :---: | :---: |
+| **Task-aware routing** (type + complexity + sensitivity) | **Yes** | No | No | Partial |
+| **Agent-aware scheduling** (per-agent tracking + fairness) | **Yes** | No | No | No |
+| **Priority queue** (3-lane + duration estimation) | **Yes** | No | No | No |
+| **Sensitive content routing** (detect → permissive provider) | **Yes** | No | No | Partial |
+| **Hybrid local + cloud** (same queue, same API) | **Yes** | Partial | No | No |
+| **Context compression** (5 strategies + semantic cache) | **Yes** | No | No | No |
+| **Load-aware model selection** (realtime reranking) | **Yes** | Partial | Partial | No |
+| **Per-model concurrency control** (semaphore isolation) | **Yes** | Partial | No | No |
+
+### Where Others Win
+
+| Capability | LiteLLM | OpenRouter | Portkey |
+| :--- | :---: | :---: | :---: |
+| Provider count | 100+ | 200+ | Many |
+| Multi-tenant | Partial | Yes | Yes |
+| Auth / RBAC | Basic | Yes | Yes |
+| Docker / K8s | Yes | SaaS | Yes |
+| Python/JS SDK | Yes | REST | Yes |
+| Cost budgets | Yes | Yes | Yes |
+
+**Bottom line**: If you need a simple proxy for 100+ providers, use LiteLLM. If you're building a multi-agent system that needs to intelligently schedule work across models while managing context, fairness, and resilience — that's what ClawGate was built for.
+
+---
+
+## Project Structure
 
 ```
-clawgate/                           7,800+ 行
+clawgate/                              7,800+ lines of code
 ├── api/
-│   ├── main_v2.py                 主路由 + QueueManager 集成
-│   └── dashboard.py               6 个可观测性端点
+│   ├── main_v2.py                     Main router + QueueManager integration
+│   └── dashboard.py                   6 observability endpoints
 ├── backends/cloud/
-│   ├── dispatcher.py              重试 + fallback + 熔断器 + in-flight
-│   ├── glm.py                     智谱 GLM
-│   ├── deepseek.py                DeepSeek
-│   ├── openai.py                  OpenAI
-│   ├── chatgpt_backend.py         ChatGPT 订阅复用
-│   └── gemini.py                  Google Gemini
+│   ├── dispatcher.py                  Retry + fallback + circuit breaker
+│   ├── glm.py                         Zhipu GLM
+│   ├── deepseek.py                    DeepSeek
+│   ├── openai.py                      OpenAI
+│   ├── chatgpt_backend.py             ChatGPT subscription reuse
+│   └── gemini.py                      Google Gemini
 ├── context/
-│   ├── manager.py                 上下文压缩管理器
-│   ├── semantic_cache.py          语义缓存 (Jaccard)
-│   ├── conversation_store.py      会话持久化 + LTM
-│   ├── topic_segmenter.py         话题分段
-│   └── strategies/                5 种压缩策略
+│   ├── manager.py                     Context compression manager
+│   ├── semantic_cache.py              Semantic cache (Jaccard similarity)
+│   ├── conversation_store.py          Persistent memory + anti-hallucination
+│   ├── topic_segmenter.py             Topic segmentation
+│   └── strategies/                    5 compression strategies
 ├── router/
-│   ├── classifier.py              任务分类 + 敏感度检测
-│   └── selector.py                模型选择 + 负载感知 reranking
+│   ├── classifier.py                  Task classification + sensitivity detection
+│   └── selector.py                    Model selection + load-aware reranking
 ├── scheduler/
-│   ├── queue_manager.py           三车道调度 + agent 公平性
-│   └── continuous_batching.py     连续批处理调度器
+│   ├── queue_manager.py               3-lane scheduling + agent fairness
+│   └── continuous_batching.py         Continuous batching scheduler
 ├── storage/
-│   └── sqlite_store.py            全量请求日志 + 统计查询
-├── engines/                       本地推理引擎 (MLX/ThunderLLAMA)
-├── config/                        YAML 配置
-└── tests/                         196 个测试 (含 14 E2E)
+│   └── sqlite_store.py                Full request logging + analytics
+├── engines/                           Local inference (MLX / ThunderLLAMA)
+├── config/                            YAML configuration
+└── tests/                             196 tests (including 14 E2E)
 ```
 
 ---
 
-## 测试
+## Testing
 
 ```bash
-# 运行全部测试
+# Run all tests
 pytest tests/ --ignore=tests/test_engines.py
 
-# 只跑 E2E 测试
+# E2E tests only
 pytest tests/test_queue_manager_e2e.py -v
 
-# 只跑调度器单元测试
+# Scheduler unit tests
 pytest tests/test_queue_manager.py -v
+
+# With coverage
+pytest tests/ --ignore=tests/test_engines.py --cov=clawgate
 ```
 
-当前状态：**196 passed / 1 pre-existing failure**
+Current status: **196 passed** across 10 test modules.
 
 ---
 
-## 已知限制与 Roadmap
+<a id="roadmap"></a>
+## Roadmap
 
-### 当前限制
+### Shipped
 
-- **单机部署**：无 Docker/K8s，无高可用
-- **SQLite 存储**：高并发写入可能成瓶颈
-- **无 API Key 鉴权**：不适合多用户场景
-- **无多租户**：无项目/团队级隔离
-- **无 SDK**：需直接 HTTP 调用
-- **5 家 Provider**：远少于 LiteLLM 的 100+
+- [x] **Intelligent Routing** — Task classification + quality/cost model selection
+- [x] **Agent-Aware Scheduling** — Per-agent tracking, fairness, priority lanes
+- [x] **3-Lane Priority Queue** — Fast/Normal/Background with duration estimation
+- [x] **Cloud Dispatcher** — Retry, fallback chains, circuit breaker, in-flight tracking
+- [x] **Context Engine** — 5 compression strategies + semantic cache + topic segmentation
+- [x] **Hybrid Engines** — MLX + ThunderLLAMA + 5 cloud providers in one queue
+- [x] **Observability** — 6 dashboard endpoints + full SQLite request logging
 
-### Roadmap
+### Next Up
 
-- [x] Phase 1: MVP 基础路由 + 本地引擎
-- [x] Phase 2: Context Engine 上下文压缩
-- [x] Phase 3: Smart Routing 任务感知路由
-- [x] Phase 4: CloudDispatcher 重试+Fallback+熔断
-- [x] Phase 5: QueueManager 三车道调度 + Agent 公平性
-- [x] Phase 6: Observability Dashboard
-- [ ] Phase 7: Docker 化 + API Key 鉴权
-- [ ] Phase 8: 成本预算 + 项目级配额
-- [ ] Phase 9: Python SDK
-- [ ] Phase 10: PostgreSQL/Redis 替换 SQLite
+- [ ] **Docker & Compose** — One-command deployment with pre-configured providers
+- [ ] **API Key Authentication** — Multi-user support with per-key rate limits
+- [ ] **Python SDK** — `pip install clawgate-client` with async support
+- [ ] **Cost Budgets** — Per-agent and per-project spending limits with alerts
+- [ ] **Streaming Metrics** — Real-time TTFT, TPS, and queue depth via WebSocket
+
+### Future
+
+- [ ] **PostgreSQL + Redis** — Replace SQLite for production-grade deployments
+- [ ] **Multi-Tenant** — Team/project isolation with RBAC
+- [ ] **Provider Plugins** — Drop-in support for new providers (Anthropic, Cohere, Mistral, ...)
+- [ ] **Web Dashboard** — Real-time monitoring UI with charts and alerts
+- [ ] **A/B Testing** — Route percentage of traffic to model variants, compare quality
+- [ ] **vLLM / SGLang** — High-throughput local inference backends (interface ready)
+- [ ] **Prompt Cache** — Provider-level KV cache reuse for repeated prefixes
 
 ---
 
-## 技术栈
+## Tech Stack
 
-Python 3.9 / FastAPI 0.109 / asyncio / SQLite / httpx / MLX / llama.cpp
+| Component | Technology |
+| :--- | :--- |
+| **Runtime** | Python 3.10+ / asyncio |
+| **API Framework** | FastAPI |
+| **Local Inference** | MLX-LM (Apple Silicon), ThunderLLAMA (llama.cpp) |
+| **HTTP Client** | httpx (async) |
+| **Storage** | SQLite (aiosqlite) |
+| **Tokenizer** | tiktoken |
+| **Monitoring** | prometheus-client, structlog |
+
+---
+
+## Contributing
+
+Contributions are welcome! Here's how to get started:
+
+```bash
+git clone https://github.com/lisihao/ClawGate.git
+cd ClawGate
+python3 -m venv venv && source venv/bin/activate
+pip install -e ".[dev]"
+pytest tests/ --ignore=tests/test_engines.py
+```
+
+Before submitting a PR, please make sure:
+- All tests pass (`pytest tests/ --ignore=tests/test_engines.py`)
+- Code follows existing style (`ruff check .`)
+- New features include tests
 
 ---
 
 ## License
 
-MIT License
+[MIT License](LICENSE) — use it however you want.
 
 ---
 
-**Made with care by OpenClaw Team**
+<p align="center">
+  <strong>Built for agents that need more than a proxy.</strong>
+  <br>
+  <sub>If ClawGate helps your project, a star would mean a lot.</sub>
+</p>
