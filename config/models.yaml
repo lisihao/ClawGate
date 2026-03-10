@@ -132,6 +132,13 @@ routing_rules:
     auto_retry_on_low_quality: true
     retry_with_stronger_model: true
 
+# 预算控制
+budget:
+  daily_limit: 5.0        # 美元/天 (0 = 无限制)
+  monthly_limit: 100.0    # 美元/月 (0 = 无限制)
+  alert_threshold: 0.8    # 80% 时开始警告
+  action: "reject"        # reject = 超限拒绝请求, warn_only = 仅日志警告
+
 # 队列调度配置
 scheduling:
   max_total_queue: 200

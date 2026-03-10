@@ -1,6 +1,6 @@
 """FastAPI 主应用 v2 - 集成 CB + ContextEngine + 云端路由 + ClawGate 7"""
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -34,12 +34,14 @@ from ..backends.cloud.gemini import GeminiBackend
 from ..backends.cloud.dispatcher import CloudDispatcher
 from ..scheduler.queue_manager import QueueManager, ScheduledRequest, DurationEstimate, AdmissionError
 from .dashboard import router as dashboard_router, init_dashboard
+from .auth import verify_api_key
+from .budget import BudgetChecker
 
 # 创建 FastAPI 应用
 app = FastAPI(
     title="OpenClaw Gateway v2",
     description="Intelligent LLM Router with Continuous Batching, ContextEngine & Cloud Routing",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # CORS 中间件
@@ -61,6 +63,7 @@ cb_scheduler: Optional[ContinuousBatchingScheduler] = None
 cloud_dispatcher: Optional[CloudDispatcher] = None
 queue_manager: Optional[QueueManager] = None
 semantic_cache: Optional[SemanticCache] = None
+budget_checker: Optional[BudgetChecker] = None
 
 # 云端后端
 cloud_backends: Dict = {}
@@ -86,6 +89,7 @@ class OpenAIRequest(BaseModel):
     agent_type: Optional[str] = None  # judge/builder/flash
     agent_id: Optional[str] = None  # agent 唯一标识 (调度公平性)
     task_id: Optional[str] = None
+    session_id: Optional[str] = None  # Session-aware context: gateway manages history
     enable_context_compression: Optional[bool] = False  # 启用上下文压缩
     target_context_tokens: Optional[int] = None  # 目标上下文 token 数
 
@@ -99,7 +103,7 @@ class OpenAIRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """启动时初始化"""
-    global engine_manager, db_store, context_manager, task_classifier, model_selector, cb_scheduler, cloud_backends, cloud_dispatcher, queue_manager, semantic_cache
+    global engine_manager, db_store, context_manager, task_classifier, model_selector, cb_scheduler, cloud_backends, cloud_dispatcher, queue_manager, semantic_cache, budget_checker
 
     print("\n" + "=" * 60)
     print("🚀 OpenClaw Gateway v2 启动中...")
@@ -218,10 +222,24 @@ async def startup_event():
         print(f"⚠️  QueueManager 初始化失败: {e}")
         queue_manager = None
 
-    # 9. 初始化 Dashboard (F4)
-    init_dashboard(db_store, cloud_dispatcher, context_manager, queue_manager)
+    # 9. 初始化 Budget Checker
+    if db_store:
+        budget_checker = BudgetChecker(db_store)
+        if budget_checker.enabled:
+            print(f"✅ BudgetChecker 已启用 (daily=${budget_checker.daily_limit} monthly=${budget_checker.monthly_limit})")
+        else:
+            print("ℹ️  BudgetChecker 未配置限额 (无预算限制)")
+
+    # 10. 初始化 Dashboard (F4)
+    init_dashboard(db_store, cloud_dispatcher, context_manager, queue_manager, budget_checker)
     app.include_router(dashboard_router)
     print("✅ Dashboard 已注册 (/dashboard/*)")
+
+    # 9b. 初始化 Sessions API
+    from .sessions import router as sessions_router, init_sessions
+    init_sessions(context_manager)
+    app.include_router(sessions_router)
+    print("✅ Sessions API 已注册 (/v1/sessions/*)")
 
     # 10. 清理过期会话段 + 长期记忆
     if context_manager and context_manager.conversation_store:
@@ -245,7 +263,8 @@ async def startup_event():
     print("  - 📊 可观测性仪表盘 (/dashboard/*)")
     print("  - 🔄 语义缓存 (Jaccard 相似度)")
     print("  - 📋 智能队列调度 (三车道 + 信号量 + Agent 公平)")
-    print("  - 📦 云端上下文适配 (F7)\n")
+    print("  - 📦 云端上下文适配 (F7)")
+    print("  - 🧩 Session-Aware Context API (/v1/sessions/*)\n")
 
 
 @app.on_event("shutdown")
@@ -283,6 +302,9 @@ async def health_check():
             "cloud_dispatcher": cloud_dispatcher is not None,
             "semantic_cache": semantic_cache is not None,
             "queue_manager": queue_manager is not None,
+            "session_aware_context": context_manager is not None and (
+                context_manager.conversation_store is not None if context_manager else False
+            ),
             "dashboard": True,
         },
         "local_models": local_models,
@@ -291,7 +313,7 @@ async def health_check():
     }
 
 
-@app.get("/models")
+@app.get("/models", dependencies=[Depends(verify_api_key)])
 async def list_models():
     """列出可用模型"""
     local_models = engine_manager.get_available_models() if engine_manager else []
@@ -317,7 +339,7 @@ async def list_models():
 # ========== OpenAI 兼容接口 ==========
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request):
     """OpenAI 兼容的聊天接口 - v2 增强版"""
     # 先读取原始 body 做调试
@@ -331,7 +353,7 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     # 兼容处理: 去掉不认识的字段，避免 422
-    known_fields = {"model", "messages", "temperature", "max_tokens", "stream", "priority", "agent_type", "agent_id", "task_id", "enable_context_compression", "target_context_tokens"}
+    known_fields = {"model", "messages", "temperature", "max_tokens", "stream", "priority", "agent_type", "agent_id", "task_id", "session_id", "enable_context_compression", "target_context_tokens"}
     filtered_data = {k: v for k, v in raw_data.items() if k in known_fields}
 
     # 兼容: model 可能是 "gateway/auto" 格式，提取实际 model
@@ -366,6 +388,21 @@ async def chat_completions(request: Request):
 
 async def _chat_completions_inner(request: OpenAIRequest):
     """OpenAI 兼容的聊天接口 - v2 增强版"""
+    # Budget check — reject early if spend limits exceeded
+    if budget_checker and budget_checker.enabled:
+        budget_status = budget_checker.check()
+        if not budget_status["allowed"]:
+            logger.warning(f"[Budget] Rejected: {budget_status['reason']}")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "message": "Budget limit exceeded. Please try again later.",
+                        "type": "budget_exceeded",
+                    }
+                },
+            )
+
     req_start = time.time()
     last_user_msg = next((m.content[:80] for m in reversed(request.messages) if m.role == "user"), "N/A")
     logger.info(
@@ -377,6 +414,35 @@ async def _chat_completions_inner(request: OpenAIRequest):
 
     # 转换消息格式
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+
+    # 0. Session-aware context: reconstruct full history from store
+    if request.session_id and context_manager and context_manager.conversation_store:
+        store = context_manager.conversation_store
+        model_name = request.model if request.model != "auto" else "glm-5"
+        model_tier = context_manager.topic_segmenter.get_model_tier(model_name)
+        target_tokens = context_manager.topic_segmenter.get_context_limit(model_name) - (request.max_tokens or 512)
+
+        try:
+            reconstructed, meta = store.reconstruct_context(
+                conversation_id=request.session_id,
+                messages=messages,
+                mode="work",
+                target_tokens=target_tokens,
+                tokenizer=context_manager.tokenizer,
+                model_tier=model_tier,
+            )
+
+            if reconstructed and len(reconstructed) > len(messages):
+                messages = reconstructed
+                logger.info(
+                    f"[Session] {request.session_id}: reconstructed {len(messages)} messages "
+                    f"(from {meta.get('stored_segments', 0)} stored segments, "
+                    f"strategy={meta.get('strategy', 'unknown')})"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[Session] Context reconstruction failed for session={request.session_id}: {e}"
+            )
 
     # 1. 上下文压缩（可选）
     if request.enable_context_compression and context_manager:
@@ -545,6 +611,36 @@ async def _chat_completions_inner(request: OpenAIRequest):
         return result
 
 
+def _store_session_exchange(
+    session_id: str, messages: List[Dict], assistant_content: str
+) -> bool:
+    """Store the full exchange (messages + assistant reply) to the session's conversation store.
+
+    Called after a successful (streaming or non-streaming) response when session_id is set.
+    Failures are logged but never block the response path.
+    """
+    if not context_manager or not context_manager.conversation_store:
+        return False
+
+    try:
+        full_exchange = messages + [{"role": "assistant", "content": assistant_content}]
+        segments = context_manager.topic_segmenter.segment(full_exchange)
+        if segments:
+            context_manager.conversation_store.store_segments(
+                conversation_id=session_id,
+                segments=segments,
+            )
+            logger.info(
+                f"[Session] Stored {len(segments)} segments for session={session_id}"
+            )
+            return True
+    except Exception as e:
+        logger.warning(
+            f"[Session] Failed to store exchange for session={session_id}: {e}"
+        )
+    return False
+
+
 def _resolve_force_route(tag: str) -> Optional[str]:
     """解析强制路由标签到具体模型名
 
@@ -629,6 +725,13 @@ async def _handle_local_request(request: OpenAIRequest, messages: List[Dict]):
         response = await engine.generate(gen_request)
         end_time = time.time()
 
+        # 计算成本 (本地模型通常为 0)
+        cost = max(0.0, model_selector.estimate_cost(
+            request.model,
+            response.input_tokens or 0,
+            response.output_tokens or 0,
+        ) if model_selector else 0.0)
+
         # 记录请求
         if db_store:
             db_store.log_request(
@@ -645,8 +748,15 @@ async def _handle_local_request(request: OpenAIRequest, messages: List[Dict]):
                     "total_time": end_time - start_time,
                     "input_tokens": response.input_tokens,
                     "output_tokens": response.output_tokens,
+                    "cost": cost,
                 }
             )
+            if budget_checker:
+                budget_checker.invalidate_cache()
+
+        # Session-aware: store exchange for future context reconstruction
+        if request.session_id:
+            _store_session_exchange(request.session_id, messages, response.content)
 
         # OpenAI 格式响应
         return {
@@ -664,7 +774,7 @@ async def _handle_local_request(request: OpenAIRequest, messages: List[Dict]):
             "usage": {
                 "prompt_tokens": response.input_tokens,
                 "completion_tokens": response.output_tokens,
-                "total_tokens": response.input_tokens + response.output_tokens,
+                "total_tokens": (response.input_tokens or 0) + (response.output_tokens or 0),
             },
         }
 
@@ -696,7 +806,8 @@ async def _handle_cloud_request(request: OpenAIRequest, messages: List[Dict]):
             logger.info(f"[云端] 流式请求 → backend={backend_name}")
             return StreamingResponse(
                 _generate_stream_cloud_dispatched(
-                    stream, request.model, backend_name, messages
+                    stream, request.model, backend_name, messages,
+                    session_id=request.session_id,
                 ),
                 media_type="text/event-stream",
             )
@@ -726,6 +837,13 @@ async def _handle_cloud_request(request: OpenAIRequest, messages: List[Dict]):
             detail=f"All backends exhausted for model '{request.model}': {str(e)[:200]}",
         )
 
+    # 计算成本
+    cost = max(0.0, model_selector.estimate_cost(
+        request.model,
+        response.input_tokens or 0,
+        response.output_tokens or 0,
+    ) if model_selector else 0.0)
+
     # Cloud Request Logging (F4 前置)
     if db_store:
         db_store.log_request({
@@ -741,8 +859,11 @@ async def _handle_cloud_request(request: OpenAIRequest, messages: List[Dict]):
             "total_time": call_time,
             "input_tokens": response.input_tokens,
             "output_tokens": response.output_tokens,
+            "cost": cost,
             "metadata": {"backend": backend_name},
         })
+        if budget_checker:
+            budget_checker.invalidate_cache()
 
     result = {
         "id": f"chatcmpl-{int(time.time())}",
@@ -759,7 +880,7 @@ async def _handle_cloud_request(request: OpenAIRequest, messages: List[Dict]):
         "usage": {
             "prompt_tokens": response.input_tokens,
             "completion_tokens": response.output_tokens,
-            "total_tokens": response.input_tokens + response.output_tokens,
+            "total_tokens": (response.input_tokens or 0) + (response.output_tokens or 0),
         },
     }
 
@@ -770,6 +891,10 @@ async def _handle_cloud_request(request: OpenAIRequest, messages: List[Dict]):
         )
         if last_user_msg:
             semantic_cache.store(last_user_msg, request.model, result)
+
+    # Session-aware: store exchange for future context reconstruction
+    if request.session_id:
+        _store_session_exchange(request.session_id, messages, response.content)
 
     return result
 
@@ -796,7 +921,8 @@ async def _generate_stream_local(engine, request: GenerationRequest, model: str)
 
 
 async def _generate_stream_cloud_dispatched(
-    stream, model: str, backend_name: str, messages: List[Dict]
+    stream, model: str, backend_name: str, messages: List[Dict],
+    session_id: Optional[str] = None,
 ):
     """云端流式生成 (via CloudDispatcher, with request logging)"""
     chunks_collected = []
@@ -832,6 +958,19 @@ async def _generate_stream_cloud_dispatched(
         # Cloud Request Logging (stream: log after completion)
         total_time = time.time() - stream_start
         full_content = "".join(chunks_collected)
+        # CJK-aware token estimation (W2 fix)
+        import re as _re
+        _cjk_chars = len(_re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', full_content))
+        _cjk_ratio = _cjk_chars / max(len(full_content), 1)
+        _chars_per_token = 1.5 if _cjk_ratio > 0.3 else 4.0
+        estimated_output_tokens = max(1, int(len(full_content) / _chars_per_token))
+        _input_text = "".join(m.get("content", "") or "" for m in messages)
+        _input_cjk = len(_re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', _input_text))
+        _input_cpt = 1.5 if (_input_cjk / max(len(_input_text), 1)) > 0.3 else 4.0
+        estimated_input_tokens = max(1, int(len(_input_text) / _input_cpt))
+        stream_cost = max(0.0, model_selector.estimate_cost(
+            model, estimated_input_tokens, estimated_output_tokens,
+        ) if model_selector else 0.0)
         if db_store:
             db_store.log_request({
                 "model": model,
@@ -840,9 +979,17 @@ async def _generate_stream_cloud_dispatched(
                 "status": "success",
                 "ttft": ttft,
                 "total_time": total_time,
-                "output_tokens": len(full_content) // 4,  # rough estimate
+                "input_tokens": estimated_input_tokens,
+                "output_tokens": estimated_output_tokens,
+                "cost": stream_cost,
                 "metadata": {"backend": backend_name, "stream": True},
             })
+            if budget_checker:
+                budget_checker.invalidate_cache()
+
+        # Session-aware: store exchange after stream completes
+        if session_id and full_content:
+            _store_session_exchange(session_id, messages, full_content)
 
     except Exception as e:
         if cloud_dispatcher:
@@ -856,6 +1003,7 @@ async def _generate_stream_cloud_dispatched(
                 "status": "error",
                 "error": str(e)[:200],
                 "total_time": time.time() - stream_start,
+                "cost": 0.0,
                 "metadata": {"backend": backend_name, "stream": True},
             })
         raise

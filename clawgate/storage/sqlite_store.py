@@ -100,6 +100,18 @@ class SQLiteStore:
                 ON requests(status);
         """
         )
+        # Schema migration: add columns that may be missing in older DBs
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(requests)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        migrations = [
+            ("agent_id", "TEXT"),
+        ]
+        for col_name, col_type in migrations:
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE requests ADD COLUMN {col_name} {col_type}")
+                print(f"  📦 Migration: added column requests.{col_name}")
+        conn.commit()
         conn.close()
 
         # context.db
@@ -756,3 +768,94 @@ class SQLiteStore:
 
         conn.commit()
         conn.close()
+
+    # ========== Budget Queries ==========
+
+    def get_daily_spend(self) -> float:
+        """Total cost for today (UTC)."""
+        with sqlite3.connect(self.db_path / "requests.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(SUM(cost), 0) FROM requests "
+                "WHERE date(timestamp) = date('now')"
+            )
+            return float(cursor.fetchone()[0])
+
+    def get_monthly_spend(self) -> float:
+        """Total cost for current month (UTC)."""
+        with sqlite3.connect(self.db_path / "requests.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(SUM(cost), 0) FROM requests "
+                "WHERE strftime('%Y-%m', timestamp) = strftime('%Y-%m', 'now')"
+            )
+            return float(cursor.fetchone()[0])
+
+    # ========== Cost Breakdown ==========
+
+    def get_cost_breakdown(self) -> Dict:
+        """Cost breakdown by model and daily trend"""
+        conn = sqlite3.connect(self.db_path / "requests.db")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Total cost last 24h
+        cursor.execute(
+            "SELECT COALESCE(SUM(cost), 0) as total "
+            "FROM requests WHERE timestamp >= datetime('now', '-24 hours')"
+        )
+        total_24h = cursor.fetchone()["total"]
+
+        # Total cost last 7d
+        cursor.execute(
+            "SELECT COALESCE(SUM(cost), 0) as total "
+            "FROM requests WHERE timestamp >= datetime('now', '-7 days')"
+        )
+        total_7d = cursor.fetchone()["total"]
+
+        # By model (last 7d)
+        cursor.execute(
+            """
+            SELECT
+                model,
+                COALESCE(SUM(cost), 0) as total_cost,
+                COUNT(*) as request_count,
+                COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                COALESCE(SUM(output_tokens), 0) as total_output_tokens
+            FROM requests
+            WHERE timestamp >= datetime('now', '-7 days')
+            GROUP BY model
+            ORDER BY total_cost DESC
+            """
+        )
+        by_model = []
+        for row in cursor.fetchall():
+            r = dict(row)
+            r["avg_cost_per_request"] = (
+                r["total_cost"] / r["request_count"]
+                if r["request_count"] > 0 else 0
+            )
+            by_model.append(r)
+
+        # Daily trend (last 7 days)
+        cursor.execute(
+            """
+            SELECT
+                date(timestamp) as date,
+                COALESCE(SUM(cost), 0) as total_cost,
+                COUNT(*) as request_count
+            FROM requests
+            WHERE timestamp >= datetime('now', '-7 days')
+            GROUP BY date(timestamp)
+            ORDER BY date ASC
+            """
+        )
+        daily_trend = [dict(row) for row in cursor.fetchall()]
+
+        conn.close()
+        return {
+            "total_cost_24h": total_24h,
+            "total_cost_7d": total_7d,
+            "by_model": by_model,
+            "daily_trend": daily_trend,
+        }
