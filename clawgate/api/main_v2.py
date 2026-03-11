@@ -23,6 +23,7 @@ from ..engines.base import GenerationRequest
 from ..storage.sqlite_store import SQLiteStore
 from ..context.manager import ContextManager
 from ..context.semantic_cache import SemanticCache
+from ..context.prompt_cache import PromptCacheManager
 from ..router.classifier import TaskClassifier
 from ..router.selector import ModelSelector
 from ..scheduler.continuous_batching import ContinuousBatchingScheduler, Request as CBRequest
@@ -37,6 +38,7 @@ from .dashboard import router as dashboard_router, init_dashboard
 from .auth import verify_api_key
 from .budget import BudgetChecker
 from ..context.context_pilot import ContextPilotOptimizer
+from ..models import ModelLifecycleManager, ModelConfig, SmartModelRouter, MemoryMonitor
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -64,11 +66,17 @@ cb_scheduler: Optional[ContinuousBatchingScheduler] = None
 cloud_dispatcher: Optional[CloudDispatcher] = None
 queue_manager: Optional[QueueManager] = None
 semantic_cache: Optional[SemanticCache] = None
+prompt_cache_manager: Optional["PromptCacheManager"] = None
 budget_checker: Optional[BudgetChecker] = None
 context_pilot: Optional[ContextPilotOptimizer] = None
 
 # 云端后端
 cloud_backends: Dict = {}
+
+# 多模型生命周期管理
+multi_model_lifecycle_manager: Optional[ModelLifecycleManager] = None
+multi_model_router: Optional[SmartModelRouter] = None
+multi_model_memory_monitor: Optional[MemoryMonitor] = None
 
 
 # ========== 请求模型 ==========
@@ -105,7 +113,7 @@ class OpenAIRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """启动时初始化"""
-    global engine_manager, db_store, context_manager, task_classifier, model_selector, cb_scheduler, cloud_backends, cloud_dispatcher, queue_manager, semantic_cache, budget_checker, context_pilot
+    global engine_manager, db_store, context_manager, task_classifier, model_selector, cb_scheduler, cloud_backends, cloud_dispatcher, queue_manager, semantic_cache, prompt_cache_manager, budget_checker, context_pilot, multi_model_lifecycle_manager, multi_model_router, multi_model_memory_monitor
 
     print("\n" + "=" * 60)
     print("🚀 OpenClaw Gateway v2 启动中...")
@@ -206,6 +214,16 @@ async def startup_event():
         semantic_cache = SemanticCache(db_store=db_store, threshold=0.85, max_size=500, ttl_hours=4)
         print("✅ SemanticCache 已启用 (Jaccard>=0.85, max=500, TTL=4h)")
 
+    # 7b. 初始化 PromptCacheManager (热/温两层缓存)
+    prompt_cache_manager = PromptCacheManager(
+        enabled=True,
+        hot_cache_size=256,
+        hot_ttl_sec=3600,  # 1小时
+        warm_cache_dir=".solar/prompt-cache/warm",
+        warm_ttl_sec=86400,  # 24小时
+    )
+    print("✅ PromptCacheManager 已启用 (热缓存: 256条/1h, 温缓存: 24h)")
+
     # 8. 初始化 QueueManager (智能队列调度)
     print("\n📋 初始化 QueueManager...")
     try:
@@ -239,8 +257,77 @@ async def startup_event():
     else:
         print("ℹ️  ContextPilot 不可用 (跳过上下文重排优化)")
 
+    # 9d. 初始化多模型生命周期管理系统
+    print("\n🔄 初始化多模型生命周期管理系统...")
+    try:
+        from pathlib import Path as _MMPath
+        import yaml as _mmyaml
+
+        _mm_config_path = _MMPath("config/multi_model.yaml")
+        if _mm_config_path.exists():
+            with open(_mm_config_path) as _mm_f:
+                _mm_config = _mmyaml.safe_load(_mm_f)
+
+            # 检查 feature_flags
+            if _mm_config.get("feature_flags", {}).get("multi_model", False):
+                # 创建模型配置
+                _mm_model_configs = {}
+                for _mm_name, _mm_model_config in _mm_config["models"].items():
+                    _mm_model_configs[_mm_name] = ModelConfig(
+                        name=_mm_model_config["name"],
+                        model_path=_mm_model_config["model_path"],
+                        port=_mm_model_config["port"],
+                        mode=_mm_model_config["mode"],
+                        n_ctx=_mm_model_config.get("n_ctx", 8192),
+                        n_gpu_layers=_mm_model_config.get("n_gpu_layers", 99),
+                        ttl_seconds=_mm_model_config.get("ttl_seconds", 0),
+                        startup_timeout=_mm_model_config.get("startup_timeout", 60),
+                    )
+
+                # 初始化 ModelLifecycleManager
+                multi_model_lifecycle_manager = ModelLifecycleManager(_mm_model_configs)
+
+                # 初始化 SmartModelRouter
+                _mm_routing_config = _mm_config.get("routing", {}).get("task_to_model", {})
+                multi_model_router = SmartModelRouter(multi_model_lifecycle_manager, _mm_routing_config)
+
+                # 初始化 MemoryMonitor
+                _mm_memory_config = _mm_config.get("memory_monitor", {})
+                if _mm_memory_config.get("enabled", True) and _mm_config.get("feature_flags", {}).get("memory_monitor", True):
+                    multi_model_memory_monitor = MemoryMonitor(
+                        lifecycle_manager=multi_model_lifecycle_manager,
+                        threshold_gb=_mm_memory_config.get("threshold_gb", 42.0),
+                        check_interval_sec=_mm_memory_config.get("check_interval_sec", 60),
+                        enabled=True,
+                    )
+                    await multi_model_memory_monitor.start()
+                    print(f"✅ MemoryMonitor 已启用 (阈值 {_mm_memory_config.get('threshold_gb', 42.0)}GB)")
+
+                # 启动 Always-On 模型
+                if _mm_config.get("startup", {}).get("preload_always_on", True):
+                    print("⏳ 启动 Always-On 模型...")
+                    await multi_model_lifecycle_manager.start_always_on_models()
+
+                print("✅ 多模型生命周期管理系统已启用 (Always-On + On-Demand + TTL)")
+            else:
+                print("ℹ️  多模型生命周期管理未启用（feature_flags.multi_model = false）")
+        else:
+            print("ℹ️  多模型配置文件不存在 (config/multi_model.yaml)")
+    except Exception as e:
+        print(f"⚠️  多模型生命周期管理系统初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
+
     # 10. 初始化 Dashboard (F4)
-    init_dashboard(db_store, cloud_dispatcher, context_manager, queue_manager, budget_checker)
+    init_dashboard(
+        db_store,
+        cloud_dispatcher,
+        context_manager,
+        queue_manager,
+        budget_checker,
+        prompt_cache_manager,
+        engine_manager,
+    )
     app.include_router(dashboard_router)
     print("✅ Dashboard 已注册 (/dashboard/*)")
 
@@ -266,7 +353,8 @@ async def startup_event():
     print("🔍 健康检查: http://localhost:8000/health")
     print("\n🎯 特性:")
     print("  - ⚡ Continuous Batching（预期 6× TTFT 提升）")
-    print("  - 🧠 ContextEngine（压缩/摘要/缓存 + 会话记忆 + Prompt Cache）")
+    print("  - 🧠 ContextEngine（压缩/摘要/缓存 + 会话记忆）")
+    print("  - 💾 Prompt Cache（热/温两层缓存，TTL=1h/24h）")
     print("  - ☁️  云端路由（GLM/OpenAI/DeepSeek + Retry + Fallback）")
     print("  - 🎯 智能调度（任务分类 + 模型选择）")
     print("  - 📊 可观测性仪表盘 (/dashboard/*)")
@@ -280,6 +368,12 @@ async def startup_event():
 async def shutdown_event():
     """关闭时清理"""
     print("\n👋 OpenClaw Gateway v2 关闭中...")
+
+    # 关闭多模型生命周期管理系统
+    if multi_model_memory_monitor:
+        await multi_model_memory_monitor.stop()
+    if multi_model_lifecycle_manager:
+        await multi_model_lifecycle_manager.shutdown_all()
 
     # 关闭 QueueManager
     if queue_manager:
@@ -310,6 +404,7 @@ async def health_check():
             "smart_routing": task_classifier is not None,
             "cloud_dispatcher": cloud_dispatcher is not None,
             "semantic_cache": semantic_cache is not None,
+            "prompt_cache": prompt_cache_manager is not None and prompt_cache_manager.enabled,
             "queue_manager": queue_manager is not None,
             "session_aware_context": context_manager is not None and (
                 context_manager.conversation_store is not None if context_manager else False
@@ -580,6 +675,28 @@ async def _chat_completions_inner(request: OpenAIRequest):
                     f"conv={pilot_meta.get('conversation_id', 'none')}"
                 )
 
+    # 4c. Prompt Cache 检查 (热/温两层缓存)
+    if prompt_cache_manager and prompt_cache_manager.enabled and not request.stream:
+        # 构建 payload 用于生成缓存键
+        payload = {
+            "model": request.model,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+            "stream": request.stream,
+        }
+
+        # 判断请求是否可缓存 (temperature=0, stream=False, n=1)
+        if PromptCacheManager.is_cacheable(payload):
+            cache_key = prompt_cache_manager.make_key(payload, messages)
+            cached_response, cache_type = prompt_cache_manager.get(cache_key)
+
+            if cached_response:
+                logger.info(
+                    f"[PromptCache] ✅ 缓存命中 | cache_type={cache_type} | "
+                    f"key={cache_key[:8]}... | model={request.model}"
+                )
+                return cached_response
+
     # F6: Semantic cache lookup (non-streaming, cloud only)
     if is_cloud_model and not request.stream and semantic_cache:
         last_user_msg_cache = next(
@@ -789,7 +906,7 @@ async def _handle_local_request(request: OpenAIRequest, messages: List[Dict]):
             _store_session_exchange(request.session_id, messages, response.content)
 
         # OpenAI 格式响应
-        return {
+        result = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
@@ -807,6 +924,21 @@ async def _handle_local_request(request: OpenAIRequest, messages: List[Dict]):
                 "total_tokens": (response.input_tokens or 0) + (response.output_tokens or 0),
             },
         }
+
+        # Store in prompt cache (non-streaming only)
+        if prompt_cache_manager and prompt_cache_manager.enabled:
+            payload = {
+                "model": request.model,
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+                "stream": request.stream,
+            }
+            if PromptCacheManager.is_cacheable(payload):
+                cache_key = prompt_cache_manager.make_key(payload, messages)
+                prompt_cache_manager.store(cache_key, result)
+                logger.debug(f"[PromptCache] 存储缓存 | key={cache_key[:8]}...")
+
+        return result
 
 
 async def _handle_cloud_request(request: OpenAIRequest, messages: List[Dict]):
@@ -921,6 +1053,19 @@ async def _handle_cloud_request(request: OpenAIRequest, messages: List[Dict]):
         )
         if last_user_msg:
             semantic_cache.store(last_user_msg, request.model, result)
+
+    # Store in prompt cache (non-streaming only)
+    if prompt_cache_manager and prompt_cache_manager.enabled:
+        payload = {
+            "model": request.model,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+            "stream": request.stream,
+        }
+        if PromptCacheManager.is_cacheable(payload):
+            cache_key = prompt_cache_manager.make_key(payload, messages)
+            prompt_cache_manager.store(cache_key, result)
+            logger.debug(f"[PromptCache] 存储缓存 | key={cache_key[:8]}...")
 
     # Session-aware: store exchange for future context reconstruction
     if request.session_id:
@@ -1054,6 +1199,7 @@ async def get_stats():
         "total_requests": len(recent_requests),
         "cb_scheduler": cb_scheduler.get_stats() if cb_scheduler else {},
         "context_pilot": context_pilot.get_stats() if context_pilot else {},
+        "prompt_cache": prompt_cache_manager.get_stats() if prompt_cache_manager else {},
     }
 
     return stats

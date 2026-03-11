@@ -9,6 +9,7 @@ Provides:
   GET /dashboard/timeline    - Time series: requests per minute (last 1 hour)
   GET /dashboard/costs       - Cost breakdown: per-model, per-backend, daily trend
   GET /dashboard/sessions    - Active sessions: count, segments, top sessions
+  GET /dashboard/cache       - Cache system: Prompt Cache stats, Cache Tuning status
 """
 
 import logging
@@ -29,16 +30,20 @@ _cloud_dispatcher = None
 _context_manager = None
 _queue_manager = None
 _budget_checker = None
+_prompt_cache_manager = None
+_engine_manager = None
 
 
-def init_dashboard(db_store, cloud_dispatcher=None, context_manager=None, queue_manager=None, budget_checker=None):
+def init_dashboard(db_store, cloud_dispatcher=None, context_manager=None, queue_manager=None, budget_checker=None, prompt_cache_manager=None, engine_manager=None):
     """Initialize dashboard with dependencies (called from startup)"""
-    global _db_store, _cloud_dispatcher, _context_manager, _queue_manager, _budget_checker
+    global _db_store, _cloud_dispatcher, _context_manager, _queue_manager, _budget_checker, _prompt_cache_manager, _engine_manager
     _db_store = db_store
     _cloud_dispatcher = cloud_dispatcher
     _context_manager = context_manager
     _queue_manager = queue_manager
     _budget_checker = budget_checker
+    _prompt_cache_manager = prompt_cache_manager
+    _engine_manager = engine_manager
 
 
 # ========== Response Models ==========
@@ -117,6 +122,34 @@ class CostsResponse(BaseModel):
     total_cost_7d: float = Field(description="Total cost in last 7 days")
     by_model: List[CostByModel] = Field(description="Cost breakdown by model")
     daily_trend: List[DailyCost] = Field(description="Daily cost trend (last 7 days)")
+
+
+class PromptCacheStats(BaseModel):
+    enabled: bool
+    hot_cache_size: int = Field(description="Current hot cache entries")
+    hot_cache_max: int = Field(description="Hot cache capacity")
+    hit_hot: int = Field(description="Hot cache hits")
+    hit_warm: int = Field(description="Warm cache hits")
+    miss: int = Field(description="Cache misses")
+    total_requests: int = Field(description="Total cacheable requests")
+    hit_rate: float = Field(description="Overall cache hit rate (0-1)")
+    store: int = Field(description="Total cache stores")
+    evict_hot: int = Field(description="Hot cache evictions")
+    evict_warm: int = Field(description="Warm cache evictions")
+
+
+class CacheTuningStats(BaseModel):
+    enabled: bool
+    current_cache_mb: int = Field(description="Current cache-ram size (MB)")
+    candidates_mb: List[int] = Field(description="Candidate cache sizes")
+    last_recommendation: Optional[int] = Field(description="Last recommended cache size (MB)")
+    last_switch_time: Optional[float] = Field(description="Last cache size switch timestamp")
+    switch_count: int = Field(description="Total number of cache size switches")
+
+
+class CacheResponse(BaseModel):
+    prompt_cache: PromptCacheStats
+    cache_tuning: Optional[CacheTuningStats] = None
 
 
 # ========== Endpoints ==========
@@ -297,3 +330,80 @@ async def dashboard_sessions():
     except Exception as e:
         logger.error(f"[Dashboard] sessions stats failed: {e}")
         return {"error": str(e)}
+
+
+@router.get("/cache", response_model=CacheResponse)
+async def dashboard_cache():
+    """Cache system statistics (Prompt Cache + Cache Tuning)
+
+    Returns:
+        - Prompt Cache stats: hot/warm hits, miss, hit_rate, evictions
+        - Cache Tuning stats: current cache_ram_mb, recommendations, switch history
+    """
+    # Default empty response
+    response = {
+        "prompt_cache": {
+            "enabled": False,
+            "hot_cache_size": 0,
+            "hot_cache_max": 0,
+            "hit_hot": 0,
+            "hit_warm": 0,
+            "miss": 0,
+            "total_requests": 0,
+            "hit_rate": 0.0,
+            "store": 0,
+            "evict_hot": 0,
+            "evict_warm": 0,
+        },
+        "cache_tuning": None,
+    }
+
+    # Prompt Cache stats
+    if _prompt_cache_manager:
+        try:
+            stats = _prompt_cache_manager.get_stats()
+            response["prompt_cache"] = stats
+        except Exception as e:
+            logger.error(f"[Dashboard] Failed to get prompt cache stats: {e}")
+
+    # Cache Tuning stats (from ThunderLLAMA Engine)
+    if _engine_manager:
+        try:
+            # Get ThunderLLAMA engine if available
+            thunderllama_engine = _engine_manager.get_engine("qwen-1.7b")  # or any local model
+            if not thunderllama_engine:
+                # Try to get any available local engine
+                available_models = _engine_manager.get_available_models()
+                if available_models:
+                    thunderllama_engine = _engine_manager.get_engine(available_models[0])
+
+            if thunderllama_engine:
+                engine_stats = thunderllama_engine.get_stats()
+
+                # Extract cache tuning info
+                if engine_stats.get("cache_tuner_enabled"):
+                    cache_tuner_stats = engine_stats.get("cache_tuner", {})
+                    last_decision = cache_tuner_stats.get("last_decision", {})
+
+                    response["cache_tuning"] = {
+                        "enabled": True,
+                        "current_cache_mb": engine_stats.get("cache_ram_mb", 0),
+                        "candidates_mb": cache_tuner_stats.get("candidates_mb", []),
+                        "last_recommendation": last_decision.get("target_cache_mb"),
+                        "last_switch_time": cache_tuner_stats.get("last_switch_time"),
+                        "switch_count": 0,  # TODO: 需要在 HeuristicCacheTuner 中添加 switch_count 字段
+                    }
+                else:
+                    # Cache tuning disabled, but still show current cache size
+                    response["cache_tuning"] = {
+                        "enabled": False,
+                        "current_cache_mb": engine_stats.get("cache_ram_mb", 0),
+                        "candidates_mb": [],
+                        "last_recommendation": None,
+                        "last_switch_time": None,
+                        "switch_count": 0,
+                    }
+        except Exception as e:
+            logger.error(f"[Dashboard] Failed to get cache tuning stats: {e}")
+
+    return response

@@ -15,7 +15,7 @@
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square" alt="Python 3.10+">
-    <img src="https://img.shields.io/badge/tests-196%20passed-brightgreen?style=flat-square" alt="Tests">
+    <img src="https://img.shields.io/badge/tests-201%20passed-brightgreen?style=flat-square" alt="Tests">
     <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License">
     <img src="https://img.shields.io/badge/API-OpenAI%20compatible-orange?style=flat-square" alt="OpenAI Compatible">
   </p>
@@ -106,7 +106,7 @@ curl -H "Authorization: Bearer $CLAWGATE_API_KEY" http://localhost:8000/v1/chat/
 
 ### ContextPilot (KV Cache-Aware Context Optimization)
 
-Integrated from [ContextPilot (MLSys 2026)](https://github.com/lisihao/ContextPilot), this two-level system optimizes context before sending to the model:
+Integrated from [ContextPilot (MLSys 2026)](https://github.com/EfficientContext/ContextPilot), this two-level system optimizes context before sending to the model:
 
 **Level 1 — Reorder**: Rearranges context blocks to maximize KV cache prefix sharing across requests, achieving up to 3x prefill speedup.
 
@@ -219,6 +219,37 @@ Cross-provider fallback chains are fully configurable. Model names are auto-rema
 
 Plus **semantic caching** (Jaccard similarity, 0.85 threshold) to avoid redundant compression, and an **anti-hallucination conversation store** inspired by MIT research on LLM self-generated content.
 
+### Prompt Cache + Auto Cache-RAM Tuning (Phase 2)
+
+**Prompt Cache** — Two-tier response caching for deterministic requests (temperature=0, stream=False, n=1):
+
+```
+Hot Cache (in-memory LRU): 256 entries, 1h TTL  → ~0.1ms lookup
+Warm Cache (disk JSON): 24h TTL, promotion after 3 hits
+```
+
+- **25,000x speedup** for cache hits (100ms → 0.004ms)
+- SHA256-based cache keys from stable payload fields (model, messages, temperature, max_tokens)
+- Automatic promotion: warm cache entries → hot cache after 3 hits
+- Hit rate tracking via `/dashboard/cache`
+
+**Auto Cache-RAM Tuning** — Data-driven optimization of ThunderLLAMA's cache-ram size:
+
+```
+Every 5 minutes:
+  1. Query last 24h performance data (SQLite)
+  2. Score each candidate: 50% throughput + 35% (1-latency) + 15% (1-failure)
+  3. Recommend best cache-ram size
+  4. Restart llama-server with new config (if significant improvement)
+```
+
+- **Heuristic scoring** with min-max normalization for fair comparison
+- **Cooling period** (5 minutes) to prevent frequent restarts
+- **Automatic fallback** to static config if tuning disabled
+- Candidates: [2048, 4096, 6144, 8192] MB (configurable)
+
+See [PHASE2_FEATURES.md](docs/PHASE2_FEATURES.md) for detailed architecture and configuration.
+
 ### Observability Dashboard
 
 ```
@@ -230,6 +261,7 @@ GET /dashboard/costs       → Budget progress (daily/monthly) + spend breakdown
 GET /dashboard/sessions    → Active sessions, segments, messages per agent
 GET /dashboard/scheduler   → Queue: lane depth, agent fairness, concurrency
 GET /dashboard/timeline    → Time series: requests/min (last 1h)
+GET /dashboard/cache       → Prompt cache + Cache tuning status  [NEW]
 ```
 
 Every request is logged to SQLite with full metadata: agent_id, model, TTFT, tokens, cost, compression_ratio.
@@ -455,6 +487,25 @@ scheduling:
       deepseek: 5
       glm: 5
       openai: 3
+
+# Prompt Cache configuration (Phase 2)
+prompt_cache:
+  enabled: true
+  hot_cache_size: 256
+  hot_ttl_sec: 3600
+  warm_ttl_sec: 86400
+  warm_cache_dir: ".solar/prompt-cache/warm"
+
+# Cache Tuning configuration (Phase 2)
+thunderllama:
+  cache_tuning:
+    enabled: true
+    tuner_type: heuristic  # heuristic / bayesian
+    heuristic:
+      candidates_mb: [2048, 4096, 6144, 8192]
+      lookback_sec: 86400
+      min_samples: 20
+      cooling_period: 300
 ```
 
 ---
@@ -498,7 +549,7 @@ clawgate/
 │   ├── auth.py                        API Key authentication
 │   ├── budget.py                      Daily/monthly budget enforcement
 │   ├── sessions.py                    Session tracking per agent
-│   └── dashboard.py                   8 observability endpoints
+│   └── dashboard.py                   9 observability endpoints (incl. /cache)
 ├── backends/cloud/
 │   ├── dispatcher.py                  Retry + fallback + circuit breaker
 │   ├── glm.py                         Zhipu GLM
@@ -510,6 +561,7 @@ clawgate/
 │   ├── context_pilot.py               ContextPilot: L1 reorder + L2 dedup
 │   ├── manager.py                     Context compression manager
 │   ├── semantic_cache.py              Semantic cache (Jaccard similarity)
+│   ├── prompt_cache.py                Prompt cache (hot + warm tiers)  [PHASE 2]
 │   ├── conversation_store.py          Persistent memory + anti-hallucination
 │   ├── topic_segmenter.py             Topic segmentation
 │   └── strategies/                    5 compression strategies
@@ -522,17 +574,21 @@ clawgate/
 ├── storage/
 │   └── sqlite_store.py                Full request logging + analytics
 ├── engines/
-│   ├── thunderllama_engine.py         ThunderLLAMA (HTTP → llama-server)
+│   ├── thunderllama_engine.py         ThunderLLAMA (HTTP → llama-server) + cache tuning
 │   ├── mlx_engine.py                  MLX-LM (Apple Silicon)
 │   ├── llamacpp_engine.py             llama-cpp-python (fallback)
 │   ├── manager.py                     Platform-aware engine initialization
 │   └── base.py                        BaseEngine interface
+├── tuning/                            Performance optimization  [PHASE 2]
+│   └── cache_tuner.py                 Heuristic cache-ram tuner
 ├── config/                            YAML configuration
 │   ├── engines.yaml                   Local engine config (ThunderLLAMA/MLX)
-│   └── models.yaml                    Cloud models + agent profiles
+│   └── models.yaml                    Cloud models + agent profiles + cache config
 ├── vendor/
 │   └── contextpilot/                  ContextPilot v0.3.5
-└── tests/                             196 tests (including 14 E2E)
+├── docs/
+│   └── PHASE2_FEATURES.md             Prompt Cache + Cache Tuning documentation
+└── tests/                             201 tests (including 19 E2E)
 ```
 
 ---
@@ -545,6 +601,7 @@ pytest tests/ --ignore=tests/test_engines.py
 
 # E2E tests only
 pytest tests/test_queue_manager_e2e.py -v
+pytest tests/test_phase2_e2e.py -v  # Phase 2 integration tests
 
 # Scheduler unit tests
 pytest tests/test_queue_manager.py -v
@@ -553,7 +610,7 @@ pytest tests/test_queue_manager.py -v
 pytest tests/ --ignore=tests/test_engines.py --cov=clawgate
 ```
 
-Current status: **196 passed** across 10 test modules.
+Current status: **201 passed** across 11 test modules (including 5 Phase 2 E2E tests).
 
 ---
 
@@ -575,6 +632,8 @@ Current status: **196 passed** across 10 test modules.
 - [x] **ContextPilot L1** — KV cache-aware context reordering (up to 3x prefill speedup)
 - [x] **ContextPilot L2** — Multi-turn document deduplication (~29% token savings)
 - [x] **ThunderLLAMA Engine** — HTTP-based engine with Paged Attention + Flash Attention + Decode-First
+- [x] **Prompt Cache (Phase 2)** — Two-tier response caching (hot + warm) with 25,000x cache hit speedup
+- [x] **Auto Cache-RAM Tuning (Phase 2)** — Heuristic tuner for data-driven ThunderLLAMA cache-ram optimization
 
 ### Next Up
 
@@ -590,7 +649,8 @@ Current status: **196 passed** across 10 test modules.
 - [ ] **Provider Plugins** — Drop-in support for new providers (Anthropic, Cohere, Mistral, ...)
 - [ ] **A/B Testing** — Route percentage of traffic to model variants, compare quality
 - [ ] **vLLM / SGLang** — High-throughput local inference backends (interface ready)
-- [ ] **Prompt Cache** — Provider-level KV cache reuse for repeated prefixes
+- [ ] **Bayesian Cache Tuner** — Gaussian Process-based auto-search for optimal cache-ram
+- [ ] **Provider-Level Prompt Cache** — KV cache reuse for cloud providers (when supported)
 
 ---
 

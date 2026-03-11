@@ -36,6 +36,8 @@ class ThunderLlamaEngine(BaseEngine):
         n_gpu_layers: int = 99,
         n_parallel: int = 4,
         n_ctx: int = 8192,
+        cache_ram_mb: int = 4096,
+        cache_tuner_config: Optional[Dict] = None,
         cont_batching: bool = True,
         flash_attention: bool = True,
         paged_attention: bool = True,
@@ -52,6 +54,7 @@ class ThunderLlamaEngine(BaseEngine):
         self.n_gpu_layers = n_gpu_layers
         self.n_parallel = n_parallel
         self.n_ctx = n_ctx
+        self.cache_ram_mb = cache_ram_mb
         self.cont_batching = cont_batching
         self.flash_attention = flash_attention
         self.paged_attention = paged_attention
@@ -71,6 +74,14 @@ class ThunderLlamaEngine(BaseEngine):
         self._request_count = 0
         self._total_tokens = 0
         self._total_time = 0.0
+
+        # Cache Tuner
+        self.cache_tuner = None
+        if cache_tuner_config and cache_tuner_config.get("enabled"):
+            self._init_cache_tuner(cache_tuner_config)
+
+        # 后台调优任务句柄
+        self._tuning_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -119,6 +130,7 @@ class ThunderLlamaEngine(BaseEngine):
             "-ngl", str(self.n_gpu_layers),
             "-np", str(self.n_parallel),
             "-c", str(self.n_ctx),
+            "--cache-ram", str(self.cache_ram_mb),
         ]
         if self.cont_batching:
             cmd.append("--cont-batching")
@@ -133,6 +145,7 @@ class ThunderLlamaEngine(BaseEngine):
             env["THUNDERLLAMA_CHUNK_PREFILL"] = str(self.chunk_prefill)
 
         logger.info("ThunderLLAMA: 启动 llama-server → %s", " ".join(cmd))
+        logger.info("ThunderLLAMA: cache-ram = %d MiB", self.cache_ram_mb)
         if self.paged_attention:
             logger.info("ThunderLLAMA: Paged Attention 已启用")
         if self.chunk_prefill is not None:
@@ -274,7 +287,7 @@ class ThunderLlamaEngine(BaseEngine):
 
     def get_stats(self) -> Dict:
         """引擎统计"""
-        return {
+        stats = {
             "engine": "thunderllama",
             "model": self.model_name,
             "model_path": self.model_path,
@@ -282,6 +295,7 @@ class ThunderLlamaEngine(BaseEngine):
             "n_gpu_layers": self.n_gpu_layers,
             "n_parallel": self.n_parallel,
             "n_ctx": self.n_ctx,
+            "cache_ram_mb": self.cache_ram_mb,
             "flash_attention": self.flash_attention,
             "paged_attention": self.paged_attention,
             "chunk_prefill": self.chunk_prefill,
@@ -294,7 +308,14 @@ class ThunderLlamaEngine(BaseEngine):
                 if self._request_count
                 else 0
             ),
+            "cache_tuner_enabled": self.cache_tuner is not None,
         }
+
+        # 添加 cache tuner 状态（如果启用）
+        if self.cache_tuner:
+            stats["cache_tuner"] = self.cache_tuner.get_stats()
+
+        return stats
 
     async def health_check(self) -> bool:
         """健康检查"""
@@ -306,6 +327,11 @@ class ThunderLlamaEngine(BaseEngine):
 
     def shutdown(self) -> None:
         """优雅停止子进程"""
+        # 停止 cache tuning 任务
+        if self._tuning_task and not self._tuning_task.done():
+            logger.info("ThunderLLAMA: 停止 Cache Tuning 任务")
+            self._tuning_task.cancel()
+
         if self._process and self._owns_process:
             logger.info(
                 "ThunderLLAMA: 停止 llama-server (PID %d)", self._process.pid
@@ -331,6 +357,131 @@ class ThunderLlamaEngine(BaseEngine):
         logger.warning("ThunderLLAMA: 触发重启")
         self.shutdown()
         await self._start_server()
+
+    # ------------------------------------------------------------------
+    # Cache Tuning
+    # ------------------------------------------------------------------
+
+    def _init_cache_tuner(self, config: Dict) -> None:
+        """初始化 Cache Tuner
+
+        Args:
+            config: cache_tuner 配置字典
+                - tuner_type: "heuristic" | "bayesian"
+                - candidates_mb: 候选值列表
+                - lookback_sec: 回溯时间窗口（秒）
+                - min_samples: 最少样本数
+                - cooling_period_sec: 冷却期（秒）
+                - min_improve_score: 最小改进阈值
+        """
+        from clawgate.tuning import HeuristicCacheTuner
+
+        tuner_type = config.get("tuner_type", "heuristic")
+
+        if tuner_type == "heuristic":
+            tuner_config = config.get("heuristic", {})
+            self.cache_tuner = HeuristicCacheTuner(
+                candidates_mb=tuner_config.get("candidates_mb", [2048, 4096, 6144, 8192]),
+                lookback_sec=tuner_config.get("lookback_sec", 86400),
+                min_samples=tuner_config.get("min_samples", 20),
+                cooling_period_sec=tuner_config.get("cooling_period_sec", 300),
+                min_improve_score=tuner_config.get("min_improve_score", 0.05)
+            )
+            logger.info(
+                "ThunderLLAMA: Cache Tuner 已初始化 (type=%s, candidates=%s)",
+                tuner_type,
+                tuner_config.get("candidates_mb", [2048, 4096, 6144, 8192])
+            )
+        elif tuner_type == "bayesian":
+            logger.warning("ThunderLLAMA: BayesianCacheTuner 尚未实现，跳过")
+            self.cache_tuner = None
+        else:
+            logger.warning("ThunderLLAMA: 未知的 tuner_type=%s，跳过", tuner_type)
+            self.cache_tuner = None
+
+    async def start_tuning_loop(
+        self,
+        metrics_provider,
+        interval_sec: int = 300
+    ) -> None:
+        """启动后台 Cache Tuning 循环
+
+        Args:
+            metrics_provider: metrics 提供函数 (async callable)
+                签名: async () -> List[Dict[str, Any]]
+                返回格式: [
+                    {
+                        "cache_ram_mb": 4096,
+                        "throughput_rps": 100.0,
+                        "avg_latency_ms": 150.0,
+                        "failure_rate": 0.01,
+                        "total": 100
+                    },
+                    ...
+                ]
+            interval_sec: 检查间隔（秒），默认 300 秒（5 分钟）
+        """
+        if not self.cache_tuner:
+            logger.warning("ThunderLLAMA: Cache Tuner 未启用，无法启动调优循环")
+            return
+
+        if not metrics_provider:
+            logger.warning("ThunderLLAMA: 未提供 metrics_provider，调优循环将无法运行")
+            return
+
+        logger.info(
+            "ThunderLLAMA: 启动 Cache Tuning 循环 (interval=%ds, current_cache=%d MB)",
+            interval_sec,
+            self.cache_ram_mb
+        )
+
+        async def tuning_loop():
+            while True:
+                try:
+                    await asyncio.sleep(interval_sec)
+
+                    # 获取性能指标
+                    metrics = await metrics_provider()
+
+                    if not metrics:
+                        logger.debug("ThunderLLAMA: 无性能数据，跳过本次调优")
+                        continue
+
+                    # 推荐新的 cache size
+                    recommended_mb = await self.cache_tuner.recommend_cache_size(
+                        metrics,
+                        current_cache_mb=self.cache_ram_mb
+                    )
+
+                    if recommended_mb is None:
+                        logger.debug("ThunderLLAMA: Cache Tuner 无推荐（可能已是最优或冷却期内）")
+                        continue
+
+                    if recommended_mb != self.cache_ram_mb:
+                        logger.info(
+                            "ThunderLLAMA: Cache Tuner 推荐切换: %d MB → %d MB",
+                            self.cache_ram_mb,
+                            recommended_mb
+                        )
+
+                        # 应用新配置（需要重启服务）
+                        old_cache = self.cache_ram_mb
+                        self.cache_ram_mb = recommended_mb
+
+                        try:
+                            await self.restart()
+                            self.cache_tuner.record_switch(recommended_mb)
+                            logger.info("ThunderLLAMA: 已切换到 %d MB", recommended_mb)
+                        except Exception as e:
+                            logger.error("ThunderLLAMA: 重启失败，回滚到 %d MB: %s", old_cache, e)
+                            self.cache_ram_mb = old_cache
+
+                except Exception as e:
+                    logger.error("ThunderLLAMA: Cache Tuning 循环异常: %s", e, exc_info=True)
+
+        # 启动后台任务
+        self._tuning_task = asyncio.create_task(tuning_loop())
+        logger.info("ThunderLLAMA: Cache Tuning 后台任务已启动")
 
     def __del__(self):
         self.shutdown()

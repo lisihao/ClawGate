@@ -156,3 +156,47 @@ scheduling:
       openai: 3
       chatgpt: 2
       gemini: 5
+
+# 上下文引擎配置（Phase 1: ThunderLLAMA 特性迁移）
+context_engine:
+  default_strategy: "adaptive"  # 默认策略: sliding_window/summarization/selective/adaptive/topic_aware/layering
+
+  # Three-tier Layering 配置（Phase 1 Week 1）
+  layering_must_have_cap: 1536       # Layer 1: system/developer 消息 token 上限
+  layering_nice_to_have_cap: 768     # Layer 2: 最近 8 条摘要 token 上限
+  layering_history_tail_cap: 512     # Layer 3: 历史摘要 token 上限
+  layering_preserve_last_turns: 6    # Layer 4: 保留最后 N 轮完整对话
+  layering_context_shift_enabled: false  # Context Shift 摘要（Phase 1 Week 2 启用）
+
+  # Context Shift 两阶段 LLM 摘要配置（Phase 1 Week 2）
+  context_shift:
+    enabled: false  # 默认禁用，启动脚本运行后可启用
+    mode: "auto"    # auto: <10轮 fast, >=10轮 quality | fast: 0.6B+0.6B | quality: 0.6B+1.7B | simple: 字符截断
+    auto_threshold: 10  # auto 模式的轮数阈值
+
+    # 服务端点配置
+    endpoints:
+      stage1: "http://127.0.0.1:18083/completion"  # Stage 1: 0.6B 抽取 FACTS/DECISIONS/OPEN_ISSUES
+      stage2: "http://127.0.0.1:18084/completion"  # Stage 2: 1.7B 压缩 + 添加 GOAL
+
+    # 超时与重试
+    timeout: 60.0       # 请求超时（秒）
+    max_retries: 3      # 最大重试次数
+
+    # Circuit Breaker 降级机制
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 3    # 连续失败次数阈值
+      reset_timeout: 300.0    # 断路器重置超时（秒，5分钟）
+
+    # 降级策略
+    fallback:
+      enabled: true
+      strategy: "simple"  # 降级到简单字符截断
+
+  # Feature Flags（快速回滚）
+  feature_flags:
+    three_tier_layering: true        # 启用 Three-tier Layering
+    context_shift: false             # Context Shift（Week 2 启用）
+    cache_tuning: false              # Auto Cache-RAM Tuning（Phase 2）
+    prompt_cache: false              # Tiered Prompt Cache（Phase 2）
