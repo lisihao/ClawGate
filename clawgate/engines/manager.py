@@ -1,6 +1,5 @@
 """引擎管理器 - 自动检测平台并初始化引擎"""
 
-import asyncio
 import os
 import platform
 import yaml
@@ -139,10 +138,13 @@ class EngineManager:
                     request_timeout=request_timeout,
                 )
 
-                # 尝试检查服务器是否已在运行
-                loop = asyncio.new_event_loop()
-                is_healthy = loop.run_until_complete(engine.health_check())
-                loop.close()
+                # 同步检查服务器是否已在运行（避免事件循环冲突）
+                import httpx as _httpx
+                try:
+                    r = _httpx.get(f"http://{host}:{port}/health", timeout=3.0)
+                    is_healthy = r.status_code == 200
+                except (_httpx.ConnectError, _httpx.TimeoutException, Exception):
+                    is_healthy = False
 
                 status = "已运行" if is_healthy else "将在首次请求时启动"
                 self.engines[model_config["name"]] = engine
