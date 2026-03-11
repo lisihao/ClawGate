@@ -36,6 +36,7 @@ from ..scheduler.queue_manager import QueueManager, ScheduledRequest, DurationEs
 from .dashboard import router as dashboard_router, init_dashboard
 from .auth import verify_api_key
 from .budget import BudgetChecker
+from ..context.context_pilot import ContextPilotOptimizer
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -64,6 +65,7 @@ cloud_dispatcher: Optional[CloudDispatcher] = None
 queue_manager: Optional[QueueManager] = None
 semantic_cache: Optional[SemanticCache] = None
 budget_checker: Optional[BudgetChecker] = None
+context_pilot: Optional[ContextPilotOptimizer] = None
 
 # 云端后端
 cloud_backends: Dict = {}
@@ -103,7 +105,7 @@ class OpenAIRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """启动时初始化"""
-    global engine_manager, db_store, context_manager, task_classifier, model_selector, cb_scheduler, cloud_backends, cloud_dispatcher, queue_manager, semantic_cache, budget_checker
+    global engine_manager, db_store, context_manager, task_classifier, model_selector, cb_scheduler, cloud_backends, cloud_dispatcher, queue_manager, semantic_cache, budget_checker, context_pilot
 
     print("\n" + "=" * 60)
     print("🚀 OpenClaw Gateway v2 启动中...")
@@ -229,6 +231,13 @@ async def startup_event():
             print(f"✅ BudgetChecker 已启用 (daily=${budget_checker.daily_limit} monthly=${budget_checker.monthly_limit})")
         else:
             print("ℹ️  BudgetChecker 未配置限额 (无预算限制)")
+
+    # 9c. 初始化 ContextPilot 优化器
+    context_pilot = ContextPilotOptimizer(enabled=True)
+    if context_pilot.enabled:
+        print("✅ ContextPilot 已启用 (上下文重排 + KV Cache 优化)")
+    else:
+        print("ℹ️  ContextPilot 不可用 (跳过上下文重排优化)")
 
     # 10. 初始化 Dashboard (F4)
     init_dashboard(db_store, cloud_dispatcher, context_manager, queue_manager, budget_checker)
@@ -548,6 +557,18 @@ async def _chat_completions_inner(request: OpenAIRequest):
             print(
                 f"📦 上下文适配: {fit_meta.get('original_tokens')}→{fit_meta.get('compressed_tokens')} tokens "
                 f"(策略: {fit_meta.get('strategy')})"
+            )
+
+    # 4b. ContextPilot 上下文重排优化 (KV Cache 感知)
+    if context_pilot and context_pilot.enabled:
+        messages, pilot_meta = context_pilot.optimize(
+            messages,
+            conversation_id=request.session_id,
+        )
+        if pilot_meta.get("optimized"):
+            logger.info(
+                f"[ContextPilot] ✅ 重排 {pilot_meta.get('blocks')} 块 | "
+                f"conv={pilot_meta.get('conversation_id', 'none')}"
             )
 
     # F6: Semantic cache lookup (non-streaming, cloud only)
@@ -1023,6 +1044,7 @@ async def get_stats():
     stats = {
         "total_requests": len(recent_requests),
         "cb_scheduler": cb_scheduler.get_stats() if cb_scheduler else {},
+        "context_pilot": context_pilot.get_stats() if context_pilot else {},
     }
 
     return stats
