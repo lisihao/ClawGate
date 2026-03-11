@@ -6,15 +6,45 @@ auto_select: true
 # 引擎优先级（按平台）
 platform_priority:
   darwin_arm64:    # Apple Silicon (M1/M2/M3)
+    - thunderllama
     - mlx
     - llamacpp
   darwin_x86_64:   # Mac Intel
+    - thunderllama
     - llamacpp
   linux:
+    - thunderllama
     - llamacpp
     - vllm
   windows:
     - llamacpp
+
+# ThunderLLAMA 配置 (HTTP → llama-server)
+thunderllama:
+  enabled: true
+  server_binary: "~/ThunderLLAMA/build/bin/llama-server"
+  host: "127.0.0.1"
+  port: 8090
+  n_gpu_layers: 99
+  n_parallel: 4
+  n_ctx: 8192
+  cont_batching: true
+  startup_timeout: 30.0
+  request_timeout: 120.0
+
+  # ThunderLLAMA 自研特性
+  flash_attention: true          # -fa 1: Flash Attention
+  paged_attention: true          # LLAMA_PAGED_ATTENTION=1: Paged KV Cache (Apple Silicon)
+  chunk_prefill: 512             # THUNDERLLAMA_CHUNK_PREFILL: Decode-First + Adaptive Chunk Prefill
+                                 # 512 = 固定值, null = 自适应(n_batch/n_slots), 999999 = 关闭
+
+  models:
+    - name: "qwen-1.7b"
+      path: "~/models/Qwen3-1.7B-Q4_K_M.gguf"
+      max_tokens: 2048
+      use_cases: [simple_qa, fast_response, testing]
+      cost_per_1k: 0.00003
+      quality_score: 0.75
 
 # MLX-LM 配置（Apple Silicon 专用）
 mlx:
@@ -36,9 +66,9 @@ mlx:
       cost_per_1k: 0.0001
       quality_score: 0.88
 
-# llama.cpp 配置（跨平台）
+# llama.cpp 配置（fallback — 当 ThunderLLAMA binary 不可用时退回 Python bindings）
 llamacpp:
-  enabled: true
+  enabled: false
   n_ctx: 32768           # 上下文长度
   n_gpu_layers: -1       # -1 = 全部加载到 GPU
   n_threads: 8           # CPU 线程数

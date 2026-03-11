@@ -1,4 +1,11 @@
-"""llama.cpp 引擎（跨平台）"""
+"""llama.cpp 引擎（跨平台） — FALLBACK
+
+当 ThunderLLAMA binary (llama-server) 不可用时退回到此引擎。
+此引擎通过 llama-cpp-python (Python bindings) 在进程内加载模型，
+性能和灵活性不如 ThunderLlamaEngine (HTTP → llama-server)。
+
+推荐使用: thunderllama_engine.py (ThunderLlamaEngine)
+"""
 
 import asyncio
 from typing import List, Dict, AsyncIterator
@@ -16,7 +23,7 @@ except ImportError:
 
 
 class LlamaCppEngine(BaseEngine):
-    """llama.cpp 引擎（跨平台高性能）"""
+    """llama.cpp 引擎 (FALLBACK — 推荐使用 ThunderLlamaEngine)"""
 
     def __init__(self, model_path: str, **kwargs):
         super().__init__("llamacpp", model_path, **kwargs)
