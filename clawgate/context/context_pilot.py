@@ -140,11 +140,13 @@ class ContextPilotOptimizer:
             }
 
         # Level 2: Multi-turn deduplication (Turn 2+)
+        # IMPORTANT: dedup only operates on system-message doc blocks.
+        # Conversation turns (user/assistant) must stay in their original
+        # positions to preserve message structure for the cloud API.
         if conversation_id and self._has_conversation_history(conversation_id):
             try:
                 return self._optimize_with_dedup(
-                    system_msg, context_blocks, query, other_messages,
-                    conversation_id,
+                    messages, conversation_id,
                 )
             except Exception as e:
                 logger.warning(f"[ContextPilot] 去重失败，回退到重排: {e}")
@@ -205,15 +207,37 @@ class ContextPilotOptimizer:
 
     def _optimize_with_dedup(
         self,
-        system_msg: Optional[Dict],
-        context_blocks: List[str],
-        query: str,
-        other_messages: List[Dict],
+        messages: List[Dict],
         conversation_id: str,
     ) -> Tuple[List[Dict], Dict]:
-        """Level 2: Deduplicate repeated context for multi-turn token savings."""
+        """Level 2: Deduplicate repeated docs in system message only.
+
+        IMPORTANT: Only deduplicates document blocks within the system
+        message. User/assistant conversation turns are preserved in their
+        original positions to maintain proper message structure for
+        stateless cloud APIs.
+        """
+        # Step 1: Find system message and extract ONLY its doc blocks
+        system_idx = None
+        system_content = ""
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "system":
+                system_idx = i
+                system_content = msg.get("content", "") or ""
+                break
+
+        if system_idx is None or not system_content:
+            self._stats["total_skipped"] += 1
+            return messages, {"optimized": False, "reason": "no_system_msg"}
+
+        doc_blocks = self._split_system_into_blocks(system_content)
+        if len(doc_blocks) < 2:
+            self._stats["total_skipped"] += 1
+            return messages, {"optimized": False, "reason": "too_few_doc_blocks"}
+
+        # Step 2: Deduplicate doc blocks only (not conversation turns)
         dedup_results = self.pilot.deduplicate(
-            [context_blocks],
+            [doc_blocks],
             conversation_id=conversation_id,
         )
         result = dedup_results[0]
@@ -221,28 +245,14 @@ class ContextPilotOptimizer:
         overlapping_docs = result["overlapping_docs"]
 
         if not overlapping_docs:
-            # No overlap found — just pass through with original order
-            logger.info(
-                f"[ContextPilot] 去重无重复块，保持原序 | "
-                f"conv={conversation_id}"
-            )
-            self._stats["total_reordered"] += 1
-            importance = " > ".join(str(i + 1) for i in range(len(context_blocks)))
-            optimized = self._reconstruct_messages(
-                system_msg, context_blocks, importance, query, other_messages,
-            )
-            return optimized, {
-                "optimized": True,
-                "method": "reorder",
-                "blocks": len(context_blocks),
+            self._stats["total_skipped"] += 1
+            return messages, {
+                "optimized": False,
+                "reason": "no_overlap",
                 "conversation_id": conversation_id,
-                "dedup_checked": True,
-                "overlap": 0,
             }
 
-        # Generate compact reference hints (NOT ContextPilot's built-in
-        # hints which embed full doc text into {doc_id} placeholder).
-        # Use short summaries: first 50 chars + index number.
+        # Step 3: Generate compact reference hints
         compact_hints = []
         for i, doc in enumerate(overlapping_docs):
             preview = doc[:50].replace("\n", " ")
@@ -252,7 +262,29 @@ class ContextPilotOptimizer:
                 f"[Ref {i + 1}] (previously sent) {preview}"
             )
 
-        # Calculate token savings (approximate: 1 token ~ 4 chars)
+        # Step 4: Rebuild ONLY the system message, keep everything else
+        parts = []
+        if compact_hints:
+            hints_text = "\n".join(f"- {h}" for h in compact_hints)
+            parts.append(f"Previously provided context (already in conversation):\n{hints_text}")
+        if new_docs:
+            docs_section = "\n".join(
+                f"[{i + 1}] {doc}" for i, doc in enumerate(new_docs)
+            )
+            parts.append(f"New context:\n{docs_section}")
+
+        new_system_content = "\n\n".join(parts) if parts else system_content
+
+        # Step 5: Reconstruct messages — only replace system, keep all
+        # user/assistant turns in their original positions
+        optimized = []
+        for i, msg in enumerate(messages):
+            if i == system_idx:
+                optimized.append({"role": "system", "content": new_system_content})
+            else:
+                optimized.append(msg)
+
+        # Calculate token savings
         overlap_chars = sum(len(d) for d in overlapping_docs)
         hint_chars = sum(len(h) for h in compact_hints)
         chars_saved = overlap_chars - hint_chars
@@ -261,14 +293,10 @@ class ContextPilotOptimizer:
         self._stats["total_deduplicated"] += 1
         self._stats["total_tokens_saved"] += tokens_saved
 
-        # Reconstruct messages with only new docs + compact reference hints
-        optimized = self._reconstruct_dedup_messages(
-            system_msg, new_docs, compact_hints, query, other_messages,
-        )
-
         logger.info(
-            f"[ContextPilot] 去重 {len(overlapping_docs)} 块 | "
-            f"新增 {len(new_docs)} 块 | "
+            f"[ContextPilot] 去重 {len(overlapping_docs)} 文档块 | "
+            f"新增 {len(new_docs)} 文档块 | "
+            f"对话轮次保持不变 | "
             f"节省 ~{tokens_saved} tokens | conv={conversation_id}"
         )
 
