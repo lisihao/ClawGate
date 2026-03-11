@@ -32,10 +32,11 @@ Your Agents ─── POST /v1/chat/completions ───▶ ClawGate
               │                                   │
          Local Engines                      Cloud Providers
     ┌─────────┴─────────┐            ┌────────────┴────────────┐
-    │  MLX (Apple M1+)  │            │  DeepSeek  ·  OpenAI    │
-    │  ThunderLLAMA     │            │  GLM  ·  Gemini         │
-    │  (llama.cpp)      │            │  ChatGPT (subscription) │
-    └───────────────────┘            └─────────────────────────┘
+    │  ThunderLLAMA      │            │  DeepSeek  ·  OpenAI    │
+    │  (Paged Attention  │            │  GLM  ·  Gemini         │
+    │   + Decode-First)  │            │  ChatGPT (subscription) │
+    │  MLX (Apple M1+)  │            └─────────────────────────┘
+    └───────────────────┘
 ```
 
 Drop in `model="auto"` and ClawGate figures out the rest: what kind of task it is, which model fits best, which lane to queue it in, and what to do when things go wrong.
@@ -51,9 +52,9 @@ Most LLM gateways treat every request the same — a dumb proxy that forwards tr
 | **Agent starvation** | One busy agent hogs all model concurrency | Per-agent tracking + fairness degradation |
 | **Wrong model for the job** | `gpt-4o` for a yes/no question burns money | Task classification → auto-selects cheapest qualified model |
 | **Provider outages** | Your whole system goes down | Circuit breaker + cross-provider fallback chains |
-| **Context explosion** | 200-turn conversations blow up token limits | 5 compression strategies + semantic caching |
+| **Context explosion** | 200-turn conversations blow up token limits | 5 compression strategies + semantic caching + ContextPilot dedup |
 | **Priority inversion** | Urgent requests stuck behind batch jobs | 3-lane priority queue with duration estimation |
-| **Local vs cloud chaos** | Separate code paths, separate configs | Unified queue — same API for MLX, llama.cpp, and cloud |
+| **Local vs cloud chaos** | Separate code paths, separate configs | Unified queue — same API for ThunderLLAMA, MLX, and cloud |
 
 **ClawGate is the missing infrastructure layer between your agent framework and the LLM providers.**
 
@@ -61,6 +62,61 @@ Most LLM gateways treat every request the same — a dumb proxy that forwards tr
 
 <a id="features"></a>
 ## Features
+
+### ThunderLLAMA Integration (Local Inference)
+
+ClawGate manages [ThunderLLAMA](https://github.com/lisihao/ThunderLLAMA) as its primary local inference engine via HTTP, with full support for ThunderLLAMA's custom Apple Silicon optimizations:
+
+| Feature | Description | Config |
+| :--- | :--- | :--- |
+| **Flash Attention** | Fused attention kernels for Metal GPU | `-fa 1` |
+| **Paged KV Cache** | Block-based KV cache with Copy-on-Write | `LLAMA_PAGED_ATTENTION=1` |
+| **Decode-First Scheduling** | Decode tokens batched before prefill to reduce TTFT | Built-in |
+| **Adaptive Chunk Prefill** | Limit prefill per slot per iteration for interleaving | `THUNDERLLAMA_CHUNK_PREFILL=512` |
+
+```yaml
+# config/engines.yaml
+thunderllama:
+  enabled: true
+  server_binary: "~/ThunderLLAMA/build/bin/llama-server"
+  port: 8090
+  flash_attention: true
+  paged_attention: true
+  chunk_prefill: 512
+```
+
+ClawGate auto-detects a running llama-server and reuses it; if none is found, it starts one as a managed subprocess with watchdog restart.
+
+### API Authentication & Budget Control
+
+```python
+# Bearer token auth
+curl -H "Authorization: Bearer $CLAWGATE_API_KEY" http://localhost:8000/v1/chat/completions ...
+
+# Budget enforcement — automatic 429 when limits exceeded
+# Configured via environment:
+#   CLAWGATE_BUDGET_DAILY=5.00
+#   CLAWGATE_BUDGET_MONTHLY=100.00
+```
+
+- **API Key auth** with constant-time comparison (timing-attack resistant)
+- **Daily & monthly budget limits** with automatic enforcement (HTTP 429)
+- **Per-request cost tracking** wired to all 4 logging sites
+- **CJK-aware token estimation** for streaming cost calculation
+
+### ContextPilot (KV Cache-Aware Context Optimization)
+
+Integrated from [ContextPilot (MLSys 2026)](https://github.com/lisihao/ContextPilot), this two-level system optimizes context before sending to the model:
+
+**Level 1 — Reorder**: Rearranges context blocks to maximize KV cache prefix sharing across requests, achieving up to 3x prefill speedup.
+
+**Level 2 — Dedup**: On Turn 2+ of multi-turn conversations, repeated document blocks are replaced with compact reference hints, saving ~25-30% prompt tokens.
+
+```
+Turn 1: [doc_A, doc_B, doc_C] → reorder for KV prefix sharing → register docs
+Turn 2: [doc_A, doc_B, doc_D] → dedup doc_A/B as hints → only doc_D sent in full
+         ↳ ~29% token savings
+```
 
 ### Task-Aware Routing
 
@@ -127,10 +183,10 @@ Local models and cloud APIs share the same queue, the same API, the same monitor
 
 | Engine | Models | Concurrency | Cost |
 | :--- | :--- | :--- | :--- |
+| **ThunderLLAMA** (HTTP) | qwen-1.7b (Paged Attn + Flash Attn) | 4 slots | Free |
 | **MLX** (Apple Silicon) | qwen2.5-7b, llama3.1-8b | 1 | Free |
-| **ThunderLLAMA** (llama.cpp) | qwen-1.7b, qwen2.5-7b-q4/q8 | 1 | Free |
 | **DeepSeek** | deepseek-r1, deepseek-v3 | 5 | $0.0014/1K |
-| **GLM** | glm-5, glm-4-flash | 5 | $0.0001–0.001/1K |
+| **GLM** | glm-5, glm-4-flash | 5 | $0.0001-0.001/1K |
 | **OpenAI** | gpt-4o | 3 | $0.005/1K |
 | **ChatGPT** (subscription) | gpt-5.2, gpt-5.1, codex | 2 | Free (subscription) |
 | **Gemini** | gemini-2.5-pro/flash | 5 | $0.00125/1K |
@@ -165,13 +221,13 @@ Plus **semantic caching** (Jaccard similarity, 0.85 threshold) to avoid redundan
 
 ### Observability Dashboard
 
-6 API endpoints for full visibility into your inference layer:
-
 ```
 GET /dashboard/overview    → 24h summary: requests, success rate, avg latency
 GET /dashboard/models      → Per-model: TTFT P50/P99, tokens, cost
 GET /dashboard/backends    → Per-backend: circuit breaker state, error rate
 GET /dashboard/context     → Context engine: cache hits, compression ratio
+GET /dashboard/costs       → Budget progress (daily/monthly) + spend breakdown
+GET /dashboard/sessions    → Active sessions, segments, messages per agent
 GET /dashboard/scheduler   → Queue: lane depth, agent fairness, concurrency
 GET /dashboard/timeline    → Time series: requests/min (last 1h)
 ```
@@ -190,41 +246,31 @@ Every request is logged to SQLite with full metadata: agent_id, model, TTFT, tok
 │  POST /v1/chat/completions (OpenAI-compatible)                      │
 │       │                                                             │
 │       ▼                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌─────────────────┐        │
-│  │TaskClassifier│───▶│ModelSelector │───▶│  QueueManager   │        │
-│  │              │    │              │    │                 │        │
-│  │ task_type    │    │ quality/cost │    │ ┌─────────────┐ │        │
-│  │ complexity   │    │ agent_prefs  │    │ │  fast lane  │ │        │
-│  │ sensitivity  │    │ load_aware   │    │ │  2 workers  │ │        │
-│  │ duration_est │    │ reranking    │    │ ├─────────────┤ │        │
-│  └──────────────┘    └──────────────┘    │ │ normal lane │ │        │
-│                                          │ │  3 workers  │ │        │
-│                                          │ ├─────────────┤ │        │
-│                                          │ │  bg lane    │ │        │
-│                                          │ │  2 workers  │ │        │
-│                                          │ └──────┬──────┘ │        │
-│                                          │ per-model sem   │        │
-│                                          │ agent fairness  │        │
-│                                          └────────┬────────┘        │
-│                                                   │                 │
-│                              ┌────────────────────┼──────────┐      │
-│                              ▼                    ▼          ▼      │
-│                      ┌──────────────┐    ┌────────────┐ ┌─────────┐ │
-│                      │CloudDispatcher│    │ MLX Engine │ │Thunder- │ │
-│                      │              │    │(Apple M1+) │ │ LLAMA   │ │
-│                      │ retry(3x)    │    └────────────┘ └─────────┘ │
-│                      │ fallback     │        Local Engines (free)    │
-│                      │ circuit_break│                                │
-│                      └──────┬───────┘                                │
-│                             │                                        │
-│              ┌──────┬───────┼───────┬──────────┐                     │
-│              ▼      ▼       ▼       ▼          ▼                     │
-│            GLM  DeepSeek  OpenAI  ChatGPT   Gemini                   │
-│                                                                      │
-│  Storage: SQLite (full request logging)                              │
-│  Context: 5 compression strategies + semantic cache                  │
-│  Monitor: 6 dashboard endpoints                                     │
-└──────────────────────────────────────────────────────────────────────┘
+│  ┌──────────┐   ┌──────────┐   ┌──────────────┐   ┌─────────────┐  │
+│  │  Auth +   │──▶│  Task    │──▶│    Model     │──▶│   Queue     │  │
+│  │  Budget   │   │Classifier│   │  Selector    │   │  Manager    │  │
+│  └──────────┘   └──────────┘   └──────────────┘   └──────┬──────┘  │
+│                                                          │         │
+│                                  ┌───────────────────────┤         │
+│                                  │                       │         │
+│                          ContextPilot               Cloud Path     │
+│                        ┌─────────┴──────────┐            │         │
+│                        │ L1: Reorder (KV$)  │            │         │
+│                        │ L2: Dedup (~29%)   │            ▼         │
+│                        └─────────┬──────────┘    ┌──────────────┐  │
+│                                  │               │CloudDispatcher│  │
+│                                  ▼               │ retry(3x)    │  │
+│                          ┌──────────────┐        │ fallback     │  │
+│                          │ThunderLLAMA  │        │ circuit_break│  │
+│                          │ (HTTP:8090)  │        └──────┬───────┘  │
+│                          │ Paged Attn   │              │          │
+│                          │ Flash Attn   │   ┌────┬─────┼────┬───┐ │
+│                          │ Decode-First │   ▼    ▼     ▼    ▼   ▼ │
+│                          ├──────────────┤  GLM  DS  OpenAI GPT Gem │
+│                          │  MLX Engine  │                          │
+│                          │ (Apple M1+)  │  Storage: SQLite         │
+│                          └──────────────┘  Monitor: 8 endpoints    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -249,6 +295,9 @@ cp .env.example .env
 #   GLM_API_KEY=your-key
 #   DEEPSEEK_API_KEY=your-key
 #   OPENAI_API_KEY=your-key       (optional)
+#   CLAWGATE_API_KEY=your-key     (for auth)
+#   CLAWGATE_BUDGET_DAILY=5.00    (optional)
+#   CLAWGATE_BUDGET_MONTHLY=100   (optional)
 ```
 
 ### 3. Launch
@@ -268,7 +317,7 @@ That's it. ClawGate is now running at `http://localhost:8000`.
 ```python
 import openai
 
-client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="any")
+client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="your-clawgate-key")
 
 # Auto-routing: ClawGate picks the best model
 response = client.chat.completions.create(
@@ -328,25 +377,48 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
-### Specify Provider Directly
+### Local Inference via ThunderLLAMA
 
 ```python
-# Force local inference (zero cost)
+# Zero cost, runs on your Mac — Paged Attention + Flash Attention enabled
 response = client.chat.completions.create(
     model="qwen-1.7b",  # ThunderLLAMA local model
     messages=[{"role": "user", "content": "Summarize this text"}]
-)
-
-# Force specific cloud provider
-response = client.chat.completions.create(
-    model="deepseek-r1",  # Direct to DeepSeek
-    messages=[{"role": "user", "content": "Debug this code"}]
 )
 ```
 
 ---
 
 ## Configuration
+
+### config/engines.yaml
+
+```yaml
+# Auto-detect platform and select best local engine
+auto_select: true
+
+platform_priority:
+  darwin_arm64: [thunderllama, mlx, llamacpp]
+  linux: [thunderllama, llamacpp, vllm]
+
+thunderllama:
+  enabled: true
+  server_binary: "~/ThunderLLAMA/build/bin/llama-server"
+  port: 8090
+  n_gpu_layers: 99
+  n_parallel: 4
+  n_ctx: 8192
+  flash_attention: true       # Flash Attention (-fa 1)
+  paged_attention: true       # Paged KV Cache (LLAMA_PAGED_ATTENTION=1)
+  chunk_prefill: 512          # Decode-First Scheduling
+  models:
+    - name: "qwen-1.7b"
+      path: "~/models/Qwen3-1.7B-Q4_K_M.gguf"
+      quality_score: 0.75
+
+llamacpp:
+  enabled: false  # Fallback when ThunderLLAMA binary unavailable
+```
 
 ### config/models.yaml
 
@@ -385,26 +457,6 @@ scheduling:
       openai: 3
 ```
 
-### config/engines.yaml
-
-```yaml
-# Auto-detect platform and select best local engine
-auto_select: true
-
-platform_priority:
-  darwin_arm64: [mlx, llamacpp]    # Apple Silicon → MLX first
-  linux: [llamacpp, vllm]          # Linux → llama.cpp, vLLM ready
-
-llamacpp:
-  enabled: true
-  n_ctx: 32768
-  n_gpu_layers: -1
-  models:
-    - name: "qwen-1.7b"
-      path: "models/qwen3-1.7b-q4.gguf"
-      quality_score: 0.75
-```
-
 ---
 
 <a id="vs-alternatives"></a>
@@ -419,7 +471,8 @@ llamacpp:
 | **Priority queue** (3-lane + duration estimation) | **Yes** | No | No | No |
 | **Sensitive content routing** (detect → permissive provider) | **Yes** | No | No | Partial |
 | **Hybrid local + cloud** (same queue, same API) | **Yes** | Partial | No | No |
-| **Context compression** (5 strategies + semantic cache) | **Yes** | No | No | No |
+| **Context optimization** (ContextPilot reorder + dedup) | **Yes** | No | No | No |
+| **Auth + Budget control** (API key + daily/monthly limits) | **Yes** | Basic | Yes | Yes |
 | **Load-aware model selection** (realtime reranking) | **Yes** | Partial | Partial | No |
 | **Per-model concurrency control** (semaphore isolation) | **Yes** | Partial | No | No |
 
@@ -429,10 +482,8 @@ llamacpp:
 | :--- | :---: | :---: | :---: |
 | Provider count | 100+ | 200+ | Many |
 | Multi-tenant | Partial | Yes | Yes |
-| Auth / RBAC | Basic | Yes | Yes |
 | Docker / K8s | Yes | SaaS | Yes |
 | Python/JS SDK | Yes | REST | Yes |
-| Cost budgets | Yes | Yes | Yes |
 
 **Bottom line**: If you need a simple proxy for 100+ providers, use LiteLLM. If you're building a multi-agent system that needs to intelligently schedule work across models while managing context, fairness, and resilience — that's what ClawGate was built for.
 
@@ -441,10 +492,13 @@ llamacpp:
 ## Project Structure
 
 ```
-clawgate/                              7,800+ lines of code
+clawgate/
 ├── api/
 │   ├── main_v2.py                     Main router + QueueManager integration
-│   └── dashboard.py                   6 observability endpoints
+│   ├── auth.py                        API Key authentication
+│   ├── budget.py                      Daily/monthly budget enforcement
+│   ├── sessions.py                    Session tracking per agent
+│   └── dashboard.py                   8 observability endpoints
 ├── backends/cloud/
 │   ├── dispatcher.py                  Retry + fallback + circuit breaker
 │   ├── glm.py                         Zhipu GLM
@@ -453,6 +507,7 @@ clawgate/                              7,800+ lines of code
 │   ├── chatgpt_backend.py             ChatGPT subscription reuse
 │   └── gemini.py                      Google Gemini
 ├── context/
+│   ├── context_pilot.py               ContextPilot: L1 reorder + L2 dedup
 │   ├── manager.py                     Context compression manager
 │   ├── semantic_cache.py              Semantic cache (Jaccard similarity)
 │   ├── conversation_store.py          Persistent memory + anti-hallucination
@@ -466,8 +521,17 @@ clawgate/                              7,800+ lines of code
 │   └── continuous_batching.py         Continuous batching scheduler
 ├── storage/
 │   └── sqlite_store.py                Full request logging + analytics
-├── engines/                           Local inference (MLX / ThunderLLAMA)
+├── engines/
+│   ├── thunderllama_engine.py         ThunderLLAMA (HTTP → llama-server)
+│   ├── mlx_engine.py                  MLX-LM (Apple Silicon)
+│   ├── llamacpp_engine.py             llama-cpp-python (fallback)
+│   ├── manager.py                     Platform-aware engine initialization
+│   └── base.py                        BaseEngine interface
 ├── config/                            YAML configuration
+│   ├── engines.yaml                   Local engine config (ThunderLLAMA/MLX)
+│   └── models.yaml                    Cloud models + agent profiles
+├── vendor/
+│   └── contextpilot/                  ContextPilot v0.3.5
 └── tests/                             196 tests (including 14 E2E)
 ```
 
@@ -503,23 +567,27 @@ Current status: **196 passed** across 10 test modules.
 - [x] **3-Lane Priority Queue** — Fast/Normal/Background with duration estimation
 - [x] **Cloud Dispatcher** — Retry, fallback chains, circuit breaker, in-flight tracking
 - [x] **Context Engine** — 5 compression strategies + semantic cache + topic segmentation
-- [x] **Hybrid Engines** — MLX + ThunderLLAMA + 5 cloud providers in one queue
-- [x] **Observability** — 6 dashboard endpoints + full SQLite request logging
+- [x] **Hybrid Engines** — ThunderLLAMA + MLX + 5 cloud providers in one queue
+- [x] **Observability** — 8 dashboard endpoints + full SQLite request logging
+- [x] **API Authentication** — Bearer token auth with constant-time comparison
+- [x] **Budget Control** — Daily/monthly spending limits with automatic 429 enforcement
+- [x] **Cost Tracking** — Per-request cost wired to all logging paths, CJK-aware estimation
+- [x] **ContextPilot L1** — KV cache-aware context reordering (up to 3x prefill speedup)
+- [x] **ContextPilot L2** — Multi-turn document deduplication (~29% token savings)
+- [x] **ThunderLLAMA Engine** — HTTP-based engine with Paged Attention + Flash Attention + Decode-First
 
 ### Next Up
 
 - [ ] **Docker & Compose** — One-command deployment with pre-configured providers
-- [ ] **API Key Authentication** — Multi-user support with per-key rate limits
 - [ ] **Python SDK** — `pip install clawgate-client` with async support
-- [ ] **Cost Budgets** — Per-agent and per-project spending limits with alerts
 - [ ] **Streaming Metrics** — Real-time TTFT, TPS, and queue depth via WebSocket
+- [ ] **Web Dashboard** — Real-time monitoring UI with charts and alerts
 
 ### Future
 
 - [ ] **PostgreSQL + Redis** — Replace SQLite for production-grade deployments
 - [ ] **Multi-Tenant** — Team/project isolation with RBAC
 - [ ] **Provider Plugins** — Drop-in support for new providers (Anthropic, Cohere, Mistral, ...)
-- [ ] **Web Dashboard** — Real-time monitoring UI with charts and alerts
 - [ ] **A/B Testing** — Route percentage of traffic to model variants, compare quality
 - [ ] **vLLM / SGLang** — High-throughput local inference backends (interface ready)
 - [ ] **Prompt Cache** — Provider-level KV cache reuse for repeated prefixes
@@ -532,7 +600,8 @@ Current status: **196 passed** across 10 test modules.
 | :--- | :--- |
 | **Runtime** | Python 3.10+ / asyncio |
 | **API Framework** | FastAPI |
-| **Local Inference** | MLX-LM (Apple Silicon), ThunderLLAMA (llama.cpp) |
+| **Local Inference** | ThunderLLAMA (HTTP → llama-server), MLX-LM (Apple Silicon) |
+| **Context Optimization** | ContextPilot (KV cache reorder + multi-turn dedup) |
 | **HTTP Client** | httpx (async) |
 | **Storage** | SQLite (aiosqlite) |
 | **Tokenizer** | tiktoken |
