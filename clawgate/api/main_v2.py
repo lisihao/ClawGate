@@ -559,17 +559,26 @@ async def _chat_completions_inner(request: OpenAIRequest):
                 f"(策略: {fit_meta.get('strategy')})"
             )
 
-    # 4b. ContextPilot 上下文重排优化 (KV Cache 感知)
+    # 4b. ContextPilot 上下文重排 + 去重优化 (KV Cache + Token Savings)
     if context_pilot and context_pilot.enabled:
         messages, pilot_meta = context_pilot.optimize(
             messages,
             conversation_id=request.session_id,
         )
         if pilot_meta.get("optimized"):
-            logger.info(
-                f"[ContextPilot] ✅ 重排 {pilot_meta.get('blocks')} 块 | "
-                f"conv={pilot_meta.get('conversation_id', 'none')}"
-            )
+            method = pilot_meta.get("method", "unknown")
+            if method == "deduplicate":
+                logger.info(
+                    f"[ContextPilot] ✅ 去重 {pilot_meta.get('deduped_blocks')} 块 | "
+                    f"新增 {pilot_meta.get('new_blocks')} 块 | "
+                    f"节省 ~{pilot_meta.get('tokens_saved', 0)} tokens | "
+                    f"conv={pilot_meta.get('conversation_id', 'none')}"
+                )
+            else:
+                logger.info(
+                    f"[ContextPilot] ✅ 重排 {pilot_meta.get('blocks')} 块 | "
+                    f"conv={pilot_meta.get('conversation_id', 'none')}"
+                )
 
     # F6: Semantic cache lookup (non-streaming, cloud only)
     if is_cloud_model and not request.stream and semantic_cache:

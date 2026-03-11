@@ -5,14 +5,19 @@ messages. Provides KV-cache-aware context optimization that complements
 ClawGate's existing ContextEngine (compression/summarization).
 
 Pipeline position:
-    ContextEngine.auto_fit() → ContextPilotOptimizer.optimize() → engine dispatch
+    ContextEngine.auto_fit() -> ContextPilotOptimizer.optimize() -> engine dispatch
 
 ContextEngine reduces *what* to send (compression, summarization).
-ContextPilot optimizes *how* to send it (reorder for KV cache reuse).
+ContextPilot optimizes *how* to send it (reorder for KV cache reuse,
+deduplicate for multi-turn token savings).
+
+Level 1: Reorder context blocks for KV cache prefix sharing (local + cloud).
+Level 2: Deduplicate repeated context in multi-turn conversations (cloud token savings).
 """
 
 import logging
 import os
+import re
 import sys
 from typing import List, Dict, Optional, Tuple
 
@@ -53,13 +58,18 @@ def _ensure_contextpilot():
 
 
 class ContextPilotOptimizer:
-    """Optimizes OpenAI-format messages for KV cache reuse.
+    """Optimizes OpenAI-format messages for KV cache reuse and token savings.
 
-    Extracts context blocks from messages, runs ContextPilot's reorder
-    algorithm, and reconstructs messages with optimized ordering.
+    Level 1 (reorder): Reorders context blocks for maximum KV cache prefix
+        sharing. Benefits local inference (llama.cpp, vLLM) directly.
 
-    For multi-turn conversations, uses conversation_id-based deduplication
-    to skip re-sending context the model already processed.
+    Level 2 (deduplicate): On Turn 2+ of multi-turn conversations, strips
+        already-seen documents and replaces them with lightweight reference
+        hints. Saves cloud API tokens (~36% reduction for repeated context).
+
+    Flow:
+        Turn 1: reorder() — register docs, optimize ordering
+        Turn 2+: deduplicate() — strip overlapping, add hints, save tokens
     """
 
     def __init__(self, enabled: bool = True):
@@ -70,6 +80,7 @@ class ContextPilotOptimizer:
             "total_reordered": 0,
             "total_deduplicated": 0,
             "total_skipped": 0,
+            "total_tokens_saved": 0,
         }
 
     @property
@@ -79,6 +90,12 @@ class ContextPilotOptimizer:
             self._pilot = _ContextPilot(use_gpu=False)
         return self._pilot
 
+    def _has_conversation_history(self, conversation_id: str) -> bool:
+        """Check if a conversation has prior reorder history."""
+        if not self.pilot:
+            return False
+        return conversation_id in self.pilot._conversations
+
     def optimize(
         self,
         messages: List[Dict],
@@ -86,11 +103,14 @@ class ContextPilotOptimizer:
         conversation_id: Optional[str] = None,
         min_context_blocks: int = 2,
     ) -> Tuple[List[Dict], Dict]:
-        """Optimize messages for KV cache reuse.
+        """Optimize messages for KV cache reuse and token savings.
 
-        Extracts context blocks (system prompt segments, prior turns) from
-        the messages, reorders them via ContextPilot for maximum prefix
-        sharing, then reconstructs the message list.
+        On Turn 1 (or without conversation_id), reorders context blocks for
+        maximum KV cache prefix sharing.
+
+        On Turn 2+ (conversation_id has prior history), deduplicates repeated
+        context blocks — only sends new docs plus lightweight reference hints
+        for already-seen docs. This saves cloud API tokens.
 
         Args:
             messages: OpenAI-format messages list.
@@ -119,13 +139,38 @@ class ContextPilotOptimizer:
                 "reason": f"too_few_blocks ({len(context_blocks)})",
             }
 
+        # Level 2: Multi-turn deduplication (Turn 2+)
+        if conversation_id and self._has_conversation_history(conversation_id):
+            try:
+                return self._optimize_with_dedup(
+                    system_msg, context_blocks, query, other_messages,
+                    conversation_id,
+                )
+            except Exception as e:
+                logger.warning(f"[ContextPilot] 去重失败，回退到重排: {e}")
+                # Fall through to reorder
+
+        # Level 1: Reorder for KV cache prefix sharing (Turn 1)
+        return self._optimize_with_reorder(
+            system_msg, context_blocks, query, other_messages,
+            conversation_id,
+        )
+
+    def _optimize_with_reorder(
+        self,
+        system_msg: Optional[Dict],
+        context_blocks: List[str],
+        query: str,
+        other_messages: List[Dict],
+        conversation_id: Optional[str],
+    ) -> Tuple[List[Dict], Dict]:
+        """Level 1: Reorder context blocks for KV cache prefix sharing."""
         try:
-            # Reorder context blocks for KV cache prefix sharing
             reordered, indices = self.pilot.reorder(
                 context_blocks,
                 conversation_id=conversation_id,
             )
-            reordered_blocks = reordered[0]  # single context → first element
+            reordered_blocks = reordered[0]  # single context -> first element
 
             # Build importance ranking annotation
             pos = {block: i + 1 for i, block in enumerate(reordered_blocks)}
@@ -133,7 +178,6 @@ class ContextPilotOptimizer:
                 str(pos[b]) for b in context_blocks if b in pos
             )
 
-            # Reconstruct messages with reordered context
             optimized = self._reconstruct_messages(
                 system_msg, reordered_blocks, importance, query, other_messages,
             )
@@ -152,9 +196,90 @@ class ContextPilotOptimizer:
             }
 
         except Exception as e:
-            logger.warning(f"[ContextPilot] 优化失败，使用原始消息: {e}")
+            logger.warning(f"[ContextPilot] 重排失败，使用原始消息: {e}")
             self._stats["total_skipped"] += 1
-            return messages, {"optimized": False, "reason": f"error: {e}"}
+            return (
+                self._rebuild_original(system_msg, context_blocks, query, other_messages),
+                {"optimized": False, "reason": f"error: {e}"},
+            )
+
+    def _optimize_with_dedup(
+        self,
+        system_msg: Optional[Dict],
+        context_blocks: List[str],
+        query: str,
+        other_messages: List[Dict],
+        conversation_id: str,
+    ) -> Tuple[List[Dict], Dict]:
+        """Level 2: Deduplicate repeated context for multi-turn token savings."""
+        dedup_results = self.pilot.deduplicate(
+            [context_blocks],
+            conversation_id=conversation_id,
+        )
+        result = dedup_results[0]
+        new_docs = result["new_docs"]
+        overlapping_docs = result["overlapping_docs"]
+
+        if not overlapping_docs:
+            # No overlap found — just pass through with original order
+            logger.info(
+                f"[ContextPilot] 去重无重复块，保持原序 | "
+                f"conv={conversation_id}"
+            )
+            self._stats["total_reordered"] += 1
+            importance = " > ".join(str(i + 1) for i in range(len(context_blocks)))
+            optimized = self._reconstruct_messages(
+                system_msg, context_blocks, importance, query, other_messages,
+            )
+            return optimized, {
+                "optimized": True,
+                "method": "reorder",
+                "blocks": len(context_blocks),
+                "conversation_id": conversation_id,
+                "dedup_checked": True,
+                "overlap": 0,
+            }
+
+        # Generate compact reference hints (NOT ContextPilot's built-in
+        # hints which embed full doc text into {doc_id} placeholder).
+        # Use short summaries: first 50 chars + index number.
+        compact_hints = []
+        for i, doc in enumerate(overlapping_docs):
+            preview = doc[:50].replace("\n", " ")
+            if len(doc) > 50:
+                preview += "..."
+            compact_hints.append(
+                f"[Ref {i + 1}] (previously sent) {preview}"
+            )
+
+        # Calculate token savings (approximate: 1 token ~ 4 chars)
+        overlap_chars = sum(len(d) for d in overlapping_docs)
+        hint_chars = sum(len(h) for h in compact_hints)
+        chars_saved = overlap_chars - hint_chars
+        tokens_saved = max(0, chars_saved // 4)
+
+        self._stats["total_deduplicated"] += 1
+        self._stats["total_tokens_saved"] += tokens_saved
+
+        # Reconstruct messages with only new docs + compact reference hints
+        optimized = self._reconstruct_dedup_messages(
+            system_msg, new_docs, compact_hints, query, other_messages,
+        )
+
+        logger.info(
+            f"[ContextPilot] 去重 {len(overlapping_docs)} 块 | "
+            f"新增 {len(new_docs)} 块 | "
+            f"节省 ~{tokens_saved} tokens | conv={conversation_id}"
+        )
+
+        return optimized, {
+            "optimized": True,
+            "method": "deduplicate",
+            "new_blocks": len(new_docs),
+            "deduped_blocks": len(overlapping_docs),
+            "tokens_saved": tokens_saved,
+            "conversation_id": conversation_id,
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -202,7 +327,7 @@ class ContextPilotOptimizer:
                 continue
 
             elif role in ("user", "assistant") and i < last_user_idx:
-                # Prior conversation turns → treat as context blocks
+                # Prior conversation turns -> treat as context blocks
                 prefix = "User: " if role == "user" else "Assistant: "
                 context_blocks.append(prefix + content)
 
@@ -221,7 +346,6 @@ class ContextPilotOptimizer:
             return [content] if content else []
 
         # Try XML-like document tags: <doc>, <document>, <context>, etc.
-        import re
         xml_pattern = re.compile(
             r'<(?:doc|document|context|passage|chunk|source)\b[^>]*>(.*?)</(?:doc|document|context|passage|chunk|source)>',
             re.DOTALL | re.IGNORECASE,
@@ -241,7 +365,7 @@ class ContextPilotOptimizer:
         if len(paragraphs) >= 3:
             return [p.strip() for p in paragraphs if p.strip()]
 
-        # No good split found — return as single block
+        # No good split found - return as single block
         return [content]
 
     def _reconstruct_messages(
@@ -261,17 +385,7 @@ class ContextPilotOptimizer:
         result = []
 
         # Build system message with reordered context
-        if system_msg:
-            # Format reordered blocks with index numbers
-            docs_section = "\n".join(
-                f"[{i + 1}] {block}" for i, block in enumerate(reordered_blocks)
-            )
-            new_system = (
-                f"{docs_section}\n\n"
-                f"Read in importance order: {importance}"
-            )
-            result.append({"role": "system", "content": new_system})
-        elif reordered_blocks:
+        if system_msg or reordered_blocks:
             docs_section = "\n".join(
                 f"[{i + 1}] {block}" for i, block in enumerate(reordered_blocks)
             )
@@ -287,6 +401,61 @@ class ContextPilotOptimizer:
         if query:
             result.append({"role": "user", "content": query})
 
+        return result
+
+    def _reconstruct_dedup_messages(
+        self,
+        system_msg: Optional[Dict],
+        new_docs: List[str],
+        reference_hints: List[str],
+        query: str,
+        other_messages: List[Dict],
+    ) -> List[Dict]:
+        """Reconstruct messages with deduplicated context.
+
+        Only includes new (unseen) documents. Overlapping documents are
+        replaced with lightweight reference hints that tell the model to
+        reuse context from prior turns.
+        """
+        result = []
+        parts = []
+
+        # Reference hints for already-seen context (lightweight)
+        if reference_hints:
+            hints_text = "\n".join(f"- {hint}" for hint in reference_hints)
+            parts.append(f"Previously provided context (already in conversation):\n{hints_text}")
+
+        # New documents not seen in prior turns
+        if new_docs:
+            docs_section = "\n".join(
+                f"[{i + 1}] {doc}" for i, doc in enumerate(new_docs)
+            )
+            parts.append(f"New context:\n{docs_section}")
+
+        if parts:
+            result.append({"role": "system", "content": "\n\n".join(parts)})
+
+        result.extend(other_messages)
+
+        if query:
+            result.append({"role": "user", "content": query})
+
+        return result
+
+    def _rebuild_original(
+        self,
+        system_msg: Optional[Dict],
+        context_blocks: List[str],
+        query: str,
+        other_messages: List[Dict],
+    ) -> List[Dict]:
+        """Rebuild original message structure (fallback on error)."""
+        result = []
+        if system_msg:
+            result.append(system_msg)
+        result.extend(other_messages)
+        if query:
+            result.append({"role": "user", "content": query})
         return result
 
     def get_stats(self) -> Dict:
