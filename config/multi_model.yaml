@@ -1,0 +1,103 @@
+# ClawGate Multi-Model Configuration
+# 支持同时运行三个模型：30B/35B (Always-On) + 1.7B/0.6B (On-Demand)
+
+# 模型定义
+models:
+  # 主推理模型 (Always-On)
+  qwen-30b:
+    name: "qwen-30b"
+    model_path: "~/models/Qwen2.5-30B-Instruct-Q4_K_M.gguf"
+    port: 8090
+    mode: "always_on"
+    n_ctx: 8192
+    n_gpu_layers: 99
+    ttl_seconds: 0  # Always-On 模式不需要 TTL
+    startup_timeout: 120
+
+  # Context Shift Stage 2 - 1.7B 压缩模型 (On-Demand)
+  qwen-1.7b:
+    name: "qwen-1.7b"
+    model_path: "~/models/Qwen2.5-1.7B-Instruct-Q4_K_M.gguf"
+    port: 18084
+    mode: "on_demand"
+    n_ctx: 4096
+    n_gpu_layers: 99
+    ttl_seconds: 900  # 15分钟空闲后卸载
+    startup_timeout: 60
+
+  # Context Shift Stage 1 - 0.6B 抽取模型 (On-Demand)
+  qwen-0.6b:
+    name: "qwen-0.6b"
+    model_path: "~/models/Qwen2.5-0.6B-Instruct-Q4_K_M.gguf"
+    port: 18083
+    mode: "on_demand"
+    n_ctx: 4096
+    n_gpu_layers: 99
+    ttl_seconds: 300  # 5分钟空闲后卸载
+    startup_timeout: 30
+
+# 路由配置
+routing:
+  # 任务类型 → 模型名称映射
+  task_to_model:
+    main_inference: "qwen-30b"
+    context_shift_stage1: "qwen-0.6b"
+    context_shift_stage2: "qwen-1.7b"
+
+# 内存监控配置
+memory_monitor:
+  enabled: true
+  threshold_gb: 42.0  # 内存超过 42GB 触发驱逐
+  check_interval_sec: 60  # 每分钟检查一次
+
+  # 驱逐策略
+  eviction:
+    strategy: "lru"  # 最久未使用优先驱逐
+    # 紧急驱逐阈值（内存使用率）
+    emergency_threshold_percent: 95
+
+# 启动配置
+startup:
+  # 启动时预加载 Always-On 模型
+  preload_always_on: true
+
+  # 启动顺序（避免同时启动导致内存峰值）
+  sequential_startup: true
+  startup_delay_sec: 5  # 每个模型启动间隔
+
+# 健康检查配置
+health_check:
+  enabled: true
+  interval_sec: 30
+  timeout_sec: 3
+
+  # 失败重试
+  max_retries: 3
+  retry_interval_sec: 10
+
+# 日志配置
+logging:
+  level: "INFO"
+  log_model_lifecycle: true
+  log_memory_stats: true
+  log_routing_decisions: true
+
+# 性能监控
+monitoring:
+  enabled: true
+  metrics_interval_sec: 60
+
+  # 收集的指标
+  collect_metrics:
+    - "model_load_time"
+    - "model_idle_time"
+    - "memory_usage"
+    - "request_count"
+    - "eviction_count"
+
+# Feature Flags
+feature_flags:
+  multi_model: true
+  memory_monitor: true
+  smart_routing: true
+  ttl_cleanup: true

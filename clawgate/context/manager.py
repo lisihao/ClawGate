@@ -13,6 +13,7 @@ from .strategies.summarization import SummarizationStrategy
 from .strategies.selective import SelectiveRetainStrategy
 from .strategies.adaptive import AdaptiveStrategy
 from .strategies.topic_aware import TopicAwareStrategy
+from .strategies.layering import ThreeTierLayeringStrategy  # Phase 1 Week 1
 from .topic_segmenter import TopicSegmenter
 from .conversation_store import ConversationStore
 from ..storage.sqlite_store import SQLiteStore
@@ -48,6 +49,13 @@ class ContextManager:
             "selective": SelectiveRetainStrategy(),
             "adaptive": AdaptiveStrategy(),
             "topic_aware": TopicAwareStrategy(),
+            "layering": ThreeTierLayeringStrategy(  # Phase 1 Week 1
+                must_have_cap=self.context_config.get("layering_must_have_cap", 1536),
+                nice_to_have_cap=self.context_config.get("layering_nice_to_have_cap", 768),
+                history_tail_cap=self.context_config.get("layering_history_tail_cap", 512),
+                preserve_last_turns=self.context_config.get("layering_preserve_last_turns", 6),
+                context_shift_enabled=self.context_config.get("layering_context_shift_enabled", False),
+            ),
         }
 
         # Topic segmenter (用于自动适配)

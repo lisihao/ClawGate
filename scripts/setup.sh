@@ -80,6 +80,24 @@ echo ""
 echo "🔍 安装 Tantivy..."
 pip install tantivy || echo "⚠️  Tantivy 安装失败（可选依赖）"
 
+# ContextPilot（关键依赖）
+echo ""
+echo "🧠 安装 ContextPilot（KV Cache 优化）..."
+if [ ! -d "vendor/contextpilot" ] || [ -z "$(ls -A vendor/contextpilot)" ]; then
+    echo "  - 克隆 ContextPilot 仓库..."
+    mkdir -p vendor
+    git clone https://github.com/EfficientContext/ContextPilot.git vendor/contextpilot
+    echo "✅ ContextPilot 仓库已克隆"
+else
+    echo "ℹ️  ContextPilot 已存在"
+fi
+
+echo "  - 安装 ContextPilot 依赖..."
+# 只安装 ClawGate 需要的核心依赖
+pip install ujson numpy scipy tqdm
+pip install elasticsearch==8.18.1 || echo "⚠️  elasticsearch 安装失败（可选）"
+echo "✅ ContextPilot 依赖安装完成"
+
 # 6. 创建必要目录
 echo ""
 echo "📁 创建目录结构..."
