@@ -320,6 +320,46 @@ Every request is logged to SQLite with full metadata: agent_id, model, TTFT, tok
 
 *Full test report: [docs/benchmarks/scenario2-clawgate-llama.md](docs/benchmarks/scenario2-clawgate-llama.md)*
 
+### Agent Scenario: Standard llama-server (Direct, Best Params)
+
+**Configuration**:
+- Model: Qwen3-30B-A3B-128K (Q5_K_M)
+- llama-server: Flash Attention + Continuous Batching (direct access, no ClawGate)
+- Test: 4 concurrent Agent requests, ~800 token system prompt, 500 max tokens
+
+**Results**:
+
+| Metric | Value |
+|--------|-------|
+| **Total Time** | 25.35s |
+| **System Throughput** | **78.88 tokens/s** |
+| **Performance vs Scenario 1** | **+50.4% faster** ⚡⚡⚡ |
+| **Performance vs Scenario 2** | **+42.8% faster** ⚡⚡ |
+
+**Key Finding**:
+- 🏆 **Direct access is fastest** - no ClawGate overhead
+- ⚠️ **ClawGate adds 30-50% latency** (routing, context management, ContextPilot processing)
+- 💡 **Trade-off**: ClawGate provides multi-backend orchestration, failover, and task routing at the cost of performance
+
+*Full test report: [docs/benchmarks/scenario3-direct-llama.md](docs/benchmarks/scenario3-direct-llama.md)*
+
+### Three-Scenario Comparison Summary
+
+| Scenario | Total Time | Throughput | ClawGate | ThunderLLAMA | Ranking |
+|----------|-----------|------------|----------|--------------|---------|
+| **Direct llama-server** | **25.35s** | **78.88 tok/s** | ❌ | ❌ | 🥇 **Fastest** |
+| ClawGate + Standard llama | 36.23s | 55.21 tok/s | ✅ | ❌ | 🥈 Second |
+| ClawGate + ThunderLLAMA | 38.15s | 52.42 tok/s | ✅ | ✅ (0% skip) | 🥉 Third |
+| **Reference: Direct ThunderLLAMA (94% skip)** | **2.91s** | **687.6 tok/s** | ❌ | ✅ | 👑 **Ideal** |
+
+**Usage Recommendations**:
+- **Simple single-backend**: Use direct llama-server (Scenario 3)
+- **Multi-backend orchestration/failover**: Use ClawGate + standard llama (Scenario 2)
+- **High cache hit scenarios**: Use direct ThunderLLAMA (skip rate 80%+, avoid ClawGate)
+- **Avoid**: ClawGate + ThunderLLAMA with 0% skip rate (worst performance)
+
+*Full comparison report: [docs/benchmarks/three-scenarios-comparison.md](docs/benchmarks/three-scenarios-comparison.md)*
+
 ---
 
 <a id="architecture"></a>
