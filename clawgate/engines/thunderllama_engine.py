@@ -201,9 +201,28 @@ class ThunderLlamaEngine(BaseEngine):
         if request.top_p is not None:
             payload["top_p"] = request.top_p
 
+        # 🔥 添加 ContextPilot Dedup headers (Phase 3 集成)
+        headers = {}
+        if hasattr(request, 'contextpilot_metadata') and request.contextpilot_metadata:
+            meta = request.contextpilot_metadata
+
+            # New format: X-Context-Signature + X-Context-Chunks
+            if meta.get("signature"):
+                headers["X-Context-Signature"] = meta["signature"]
+
+            if meta.get("chunk_hashes"):
+                headers["X-Context-Chunks"] = json.dumps(meta["chunk_hashes"])
+
+            # Legacy format: x-contextpilot-optimal-order (deprecated)
+            if meta.get("optimized") and meta.get("method") == "metadata_reorder":
+                headers["x-contextpilot-optimal-order"] = str(meta.get("optimal_order", []))
+                headers["x-contextpilot-blocks"] = str(meta.get("blocks", 0))
+                headers["x-contextpilot-importance"] = meta.get("importance", "")
+
         resp = await self.client.post(
             "/v1/chat/completions",
             json=payload,
+            headers=headers if headers else None,
         )
         resp.raise_for_status()
         data = resp.json()
