@@ -39,6 +39,13 @@ thunderllama:
                                  # 512 = 固定值, null = 自适应(n_batch/n_slots), 999999 = 关闭
 
   models:
+    - name: "qwen3-30b"
+      path: "/Users/lisihao/models/qwen3-30b-a3b-gguf/Qwen3-30B-A3B-128K-Q5_K_M.gguf"
+      max_tokens: 2048
+      use_cases: [agent, coding]
+      cost_per_1k: 0.0001
+      quality_score: 0.95
+
     - name: "qwen-1.7b"
       path: "~/models/Qwen3-1.7B-Q4_K_M.gguf"
       max_tokens: 2048

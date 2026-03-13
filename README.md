@@ -297,6 +297,29 @@ Every request is logged to SQLite with full metadata: agent_id, model, TTFT, tok
 
 *Full test report: [docs/benchmarks/scenario1-clawgate-thunder.md](docs/benchmarks/scenario1-clawgate-thunder.md)*
 
+### Agent Scenario: ClawGate + Standard llama.cpp (ClawGate Optimizations Only)
+
+**Configuration**:
+- Model: Qwen3-30B-A3B-128K (Q5_K_M)
+- llama-server: Flash Attention + Continuous Batching (no ThunderLLAMA features)
+- ClawGate: ContextPilot (Reorder + Dedup) + Prefix Cache
+- Test: 4 concurrent Agent requests, ~800 token system prompt, 500 max tokens
+
+**Results**:
+
+| Metric | Value |
+|--------|-------|
+| **Total Time** | 36.23s |
+| **System Throughput** | **55.21 tokens/s** |
+| **Performance vs Scenario 1** | **+5.3% faster** ⚡ |
+
+**Key Finding**:
+- ⚠️ **Standard llama.cpp outperformed ThunderLLAMA** in this scenario!
+- **Why**: LMCache/Chunk Prefill overhead without skip benefits (0% skip rate)
+- **Implication**: ThunderLLAMA optimizations need high cache hit rate to be effective
+
+*Full test report: [docs/benchmarks/scenario2-clawgate-llama.md](docs/benchmarks/scenario2-clawgate-llama.md)*
+
 ---
 
 <a id="architecture"></a>
