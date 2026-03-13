@@ -268,6 +268,37 @@ Every request is logged to SQLite with full metadata: agent_id, model, TTFT, tok
 
 ---
 
+## Performance Benchmarks
+
+### Agent Scenario: ClawGate + ThunderLLAMA (Full Optimizations)
+
+**Configuration**:
+- Model: Qwen3-30B-A3B-128K (Q5_K_M)
+- ThunderLLAMA: LMCache + Flash Attention + Chunk Prefill (512) + Continuous Batching
+- ClawGate: ContextPilot (Reorder + Dedup) + Prefix Cache
+- Test: 4 concurrent Agent requests, ~800 token system prompt, 500 max tokens
+
+**Results**:
+
+| Metric | Value |
+|--------|-------|
+| **Total Time** | 38.15s |
+| **System Throughput** | **52.42 tokens/s** |
+| **LMCache L2 Hit Rate** | 99.9% |
+| **Prefill Count** | 3 (saved 25% vs 4 requests) |
+
+**Key Features Demonstrated**:
+- ✅ ThunderLLAMA backend auto-detection and reuse
+- ✅ ContextPilot KV cache optimization (99.9% L2 hit rate)
+- ✅ Multi-engine orchestration (ClawGate + ThunderLLAMA)
+- ✅ Concurrent request handling with queue management
+
+**Note**: Full LMCache skip logic (94% skip rate) is achievable with direct ThunderLLAMA access. ClawGate adds context management overhead but provides task routing, failover, and multi-backend orchestration capabilities.
+
+*Full test report: [docs/benchmarks/scenario1-clawgate-thunder.md](docs/benchmarks/scenario1-clawgate-thunder.md)*
+
+---
+
 <a id="architecture"></a>
 ## Architecture
 
