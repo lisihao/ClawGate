@@ -43,6 +43,32 @@ Drop in `model="auto"` and ClawGate figures out the rest: what kind of task it i
 
 ---
 
+## 🚀 Performance Highlights (with ThunderLLAMA Integration)
+
+**Phase 3 Completion (2026-03-13)**: End-to-end optimization with ContextPilot + LMCache
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| **First-turn Latency** | 594ms | 197ms | **-67%** ⬇️ |
+| **Multi-turn Speed** | 424ms | 40ms | **10.6x** faster |
+| **Cross-session** | N/A | 22-89ms | **22-33x** (disk cache) |
+
+**Integration Flow**:
+```
+ClawGate
+    ↓ (ContextPilot dedup + chunk hashes)
+ThunderLLAMA (Port 8090)
+    ↓ (LMCache L2 + L3)
+Metal GPU (Paged Attention)
+
+Headers: X-Context-Signature, X-Context-Chunks
+Result:  67% latency reduction
+```
+
+**📖 [Full Integration Documentation](docs/THUNDERLLAMA_INTEGRATION.md)**
+
+---
+
 ## Why ClawGate?
 
 Most LLM gateways treat every request the same — a dumb proxy that forwards traffic. That works fine for single-user chatbots, but **multi-agent systems have fundamentally different needs:**
